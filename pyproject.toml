@@ -1,0 +1,154 @@
+# ================================================================
+#  ChisCode — pyproject.toml
+#  Package manager: uv
+#
+#  uv sync                    # runtime deps only (used in Docker)
+#  uv sync --group dev        # + test/lint tools (local dev)
+#  uv run uvicorn app.main:app --reload
+#  uv run pytest
+# ================================================================
+
+[project]
+name            = "chiscode"
+version         = "0.1.0"
+description     = "AI-powered agent builder — natural language to production-ready apps"
+license         = { text = "MIT" }
+authors         = [{ name = "ChisCode Team" }]
+
+# Matches python:3.11-slim Docker base exactly.
+# Upper bound stops uv attempting cross-version resolution,
+# which surfaces phantom conflicts on versions we never run.
+requires-python = ">=3.11,<3.12"
+
+# ── Runtime dependencies ──────────────────────────────────────
+dependencies = [
+    # Web Framework
+    "fastapi[all]==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "python-multipart==0.0.12",
+    "jinja2==3.1.4",
+    "aiofiles==24.1.0",
+    "websockets==13.1",
+
+    # AI / LLM Orchestration
+    "langchain==0.3.7",
+    "langchain-core==0.3.19",
+    "langchain-mistralai==0.2.1",
+    "langgraph==0.2.45",
+    "langsmith==0.1.141",
+
+    # Data Validation
+    "pydantic==2.9.2",
+    "pydantic-settings==2.6.1",
+    "email-validator==2.2.0",
+
+    # Databases
+    # motor 3.6.0 requires pymongo>=4.9,<4.10 — pinned to match
+    "motor==3.6.0",
+    "certifi>=2024.2.2",   # TLS CA bundle for Atlas SSL validation
+    "pymongo==4.9.2",
+    "redis[hiredis]==5.2.0",        # Upstash HTTP REST client (replaces redis-py)
+    "pinecone-client==5.0.1",
+
+    # Auth & Security
+    "python-jose[cryptography]==3.3.0",
+    "passlib[bcrypt]==1.7.4",
+    "bcrypt==4.0.1",
+    "cryptography==43.0.3",
+    "pyjwt==2.10.1",
+
+    # HTTP Client
+    "httpx[http2]==0.27.2",
+
+    # Resilience
+    "tenacity==9.0.0",
+
+    # Search
+    "duckduckgo-search==6.3.7",
+
+    # Utilities
+    "orjson==3.10.11",
+    "arrow==1.3.0",
+    "shortuuid==1.0.13",
+
+    # Logging
+    "structlog==24.4.0",
+    "rich==13.9.4",
+]
+
+# ── [project.optional-dependencies] ─────────────────────────────────────────
+# PEP 735 — replaces the deprecated [tool.uv.dev-dependencies]
+# Docker: uv sync --no-group dev   (runtime only)
+# Local:  uv sync --group dev      (runtime + dev tools)
+[dependency-groups]
+dev = [
+    "pytest==8.3.3",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "anyio==4.6.2",
+    "ruff==0.7.4",
+    "mypy==1.13.0",
+    "types-passlib",
+    "types-python-jose",
+]
+
+# ── NO [build-system] block ───────────────────────────────────
+# uv sync installs dependencies directly — it does NOT invoke a
+# build backend unless you run `uv build` to publish to PyPI.
+# Including [build-system] + hatchling caused the Docker build to
+# fail because hatchling tried to locate README.md (absent from
+# the /build context) before installing any packages.
+# Removing it is the correct fix — not working around it.
+
+# ── Ruff ─────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py311"
+line-length    = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length — ruff format handles this
+    "B008",  # function calls in default args — FastAPI Depends() pattern
+    "N806",  # lowercase variable — pydantic field patterns
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+force-single-line  = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**"    = ["S101"]
+"app/main.py" = ["ANN"]
+
+[tool.ruff.format]
+quote-style  = "double"
+indent-style = "space"
+line-ending  = "lf"
+
+# ── Mypy ─────────────────────────────────────────────────────
+[tool.mypy]
+python_version         = "3.11"
+strict                 = false
+ignore_missing_imports = true
+disallow_untyped_defs  = true
+check_untyped_defs     = true
+plugins                = ["pydantic.mypy"]
+
+# ── Pytest ───────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths    = ["tests"]
+addopts      = "-v --tb=short --cov=app --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["app"]
+omit   = ["tests/*", "app/main.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
