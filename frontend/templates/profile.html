@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Profile — ChisCode{% endblock %}
+
+{% block body %}
+<div class="profile-container" style="padding: 2rem;">
+    <h1>Your Profile</h1>
+    <div id="profile-content">
+        <div class="loading">Loading profile data...</div>
+    </div>
+</div>
+
+<script>
+async function loadProfile() {
+    try {
+        const response = await fetch('/api/v1/users/me', {
+            credentials: 'include'
+        });
+        
+        if (response.ok) {
+            const user = await response.json();
+            document.getElementById('profile-content').innerHTML = `
+                <div class="profile-card">
+                    <p><strong>Username:</strong> ${user.username}</p>
+                    <p><strong>Email:</strong> ${user.email}</p>
+                    <p><strong>Plan:</strong> ${user.plan}</p>
+                    <p><strong>Member since:</strong> ${new Date(user.created_at).toLocaleDateString()}</p>
+                </div>
+            `;
+        }
+    } catch (error) {
+        console.error('Profile error:', error);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', loadProfile);
+</script>
+{% endblock %}
