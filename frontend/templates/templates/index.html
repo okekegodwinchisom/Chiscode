@@ -1,0 +1,491 @@
+{% extends "base.html" %}
+{% block title %}Template Library — ChisCode{% endblock %}
+
+{% block head %}
+<style>
+  .lib-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.5rem;
+  }
+
+  /* Search + filter bar */
+  .filter-bar {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 1.25rem;
+  }
+  .filter-bar .form-input {
+    flex: 1;
+    min-width: 180px;
+    max-width: 320px;
+  }
+  .filter-chip {
+    padding: 0.3rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    background: transparent;
+    color: var(--ghost);
+    font-size: 0.72rem;
+    font-family: var(--font-ui);
+    cursor: pointer;
+    transition: all 0.12s;
+    white-space: nowrap;
+  }
+  .filter-chip:hover  { border-color: var(--electric); color: var(--electric); }
+  .filter-chip.active { border-color: var(--electric); color: var(--void); background: var(--electric); }
+
+  /* Template grid */
+  .tmpl-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 1rem;
+  }
+
+  .tmpl-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    padding: 1.1rem 1.1rem 0.9rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    transition: border-color 0.15s, transform 0.12s;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+  }
+  .tmpl-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(0,229,255,0.04) 0%, transparent 60%);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .tmpl-card:hover { border-color: var(--electric); transform: translateY(-2px); }
+  .tmpl-card:hover::before { opacity: 1; }
+
+  .tmpl-card__icon {
+    font-size: 1.6rem;
+    line-height: 1;
+  }
+  .tmpl-card__name {
+    font-family: var(--font-display);
+    font-size: 0.92rem;
+    font-weight: 800;
+    color: var(--white);
+    line-height: 1.25;
+  }
+  .tmpl-card__desc {
+    font-size: 0.74rem;
+    color: var(--ghost);
+    line-height: 1.5;
+    flex: 1;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .tmpl-card__tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+  .tmpl-tag {
+    font-size: 0.62rem;
+    font-family: var(--font-ui);
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    background: var(--raised);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .tmpl-card__footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    padding-top: 0.55rem;
+    margin-top: 0.1rem;
+  }
+  .tmpl-card__stack {
+    font-family: var(--font-code);
+    font-size: 0.65rem;
+    color: var(--electric);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 55%;
+  }
+
+  /* Complexity badge */
+  .cmplx-simple  { color: var(--neon); }
+  .cmplx-moderate { color: var(--amber); }
+  .cmplx-complex { color: var(--plasma); }
+
+  /* Use template modal */
+  .use-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 300;
+    background: rgba(0,0,0,0.85);
+    backdrop-filter: blur(12px);
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+  }
+  .use-modal.open { display: flex; }
+  .use-modal__box {
+    background: var(--deep);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 1.75rem;
+    max-width: 440px;
+    width: 100%;
+  }
+
+  /* Empty / loading states */
+  .state-box {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--muted);
+    grid-column: 1/-1;
+  }
+  .state-box__icon { font-size: 2rem; margin-bottom: 0.5rem; }
+  .state-box__text { font-size: 0.82rem; }
+
+  /* Pagination */
+  .pagination {
+    display: flex;
+    justify-content: center;
+    gap: 0.5rem;
+    margin-top: 1.5rem;
+    flex-wrap: wrap;
+  }
+  .page-btn {
+    min-width: 36px;
+    height: 36px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--ghost);
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: all 0.12s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .page-btn:hover   { border-color: var(--electric); color: var(--electric); }
+  .page-btn.current { background: var(--electric); color: var(--void); border-color: var(--electric); font-weight: 800; }
+  .page-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+</style>
+{% endblock %}
+
+{% block body %}
+<nav class="nav">
+  <a href="/dashboard" style="display:flex;align-items:center;gap:.4rem;color:var(--ghost);font-size:.8rem;text-decoration:none;margin-right:1rem">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+    Dashboard
+  </a>
+  <a href="/" class="nav__logo">Chis<span>Code</span></a>
+  <div class="nav__links">
+    <a href="/dashboard" class="btn btn-ghost btn-sm">My Projects</a>
+  </div>
+</nav>
+
+<div style="max-width:1100px;margin:0 auto;padding:1.5rem 1rem 3rem">
+
+  <div class="lib-header">
+    <div>
+      <h1 style="font-family:var(--font-display);font-size:1.4rem;font-weight:800;margin-bottom:0.2rem">
+        Template Library
+      </h1>
+      <p style="font-size:0.82rem;color:var(--ghost)">
+        Start from a battle-tested blueprint instead of a blank prompt.
+      </p>
+    </div>
+    <div style="display:flex;gap:.5rem;align-items:center">
+      <span id="result-count" style="font-size:.75rem;color:var(--muted)"></span>
+    </div>
+  </div>
+
+  <!-- ── Search + filters ── -->
+  <div class="filter-bar">
+    <input
+      id="search-input"
+      class="form-input"
+      type="text"
+      placeholder="Search templates…"
+      oninput="debounceSearch()"
+      autocomplete="off"
+    />
+    <button class="filter-chip active" data-filter="app_type" data-val="" onclick="setFilter(this,'app_type','')">All</button>
+    <button class="filter-chip" data-filter="app_type" data-val="web_app"    onclick="setFilter(this,'app_type','web_app')">Web App</button>
+    <button class="filter-chip" data-filter="app_type" data-val="api"         onclick="setFilter(this,'app_type','api')">API</button>
+    <button class="filter-chip" data-filter="app_type" data-val="landing_page" onclick="setFilter(this,'app_type','landing_page')">Landing</button>
+    <button class="filter-chip" data-filter="app_type" data-val="automation"  onclick="setFilter(this,'app_type','automation')">Automation</button>
+    <span style="color:var(--border)">|</span>
+    <button class="filter-chip active" data-filter="complexity" data-val="" onclick="setFilter(this,'complexity','')">Any complexity</button>
+    <button class="filter-chip" data-filter="complexity" data-val="simple"   onclick="setFilter(this,'complexity','simple')">Simple</button>
+    <button class="filter-chip" data-filter="complexity" data-val="moderate" onclick="setFilter(this,'complexity','moderate')">Moderate</button>
+    <button class="filter-chip" data-filter="complexity" data-val="complex"  onclick="setFilter(this,'complexity','complex')">Complex</button>
+  </div>
+
+  <!-- ── Template grid ── -->
+  <div class="tmpl-grid" id="tmpl-grid">
+    <div class="state-box">
+      <div class="state-box__icon">⏳</div>
+      <div class="state-box__text">Loading templates…</div>
+    </div>
+  </div>
+
+  <!-- ── Pagination ── -->
+  <div class="pagination" id="pagination" style="display:none"></div>
+
+</div>
+
+<!-- ── Use Template Modal ── -->
+<div class="use-modal" id="use-modal" onclick="if(event.target===this)closeModal()">
+  <div class="use-modal__box">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1rem">
+      <div>
+        <div id="modal-icon" style="font-size:1.6rem;margin-bottom:.35rem"></div>
+        <h2 id="modal-name" style="font-family:var(--font-display);font-size:1.1rem;font-weight:800"></h2>
+        <p id="modal-desc" style="font-size:.77rem;color:var(--ghost);margin-top:.25rem;line-height:1.5"></p>
+      </div>
+      <button onclick="closeModal()" style="background:none;border:none;color:var(--ghost);cursor:pointer;font-size:1.4rem;line-height:1;padding:0">×</button>
+    </div>
+
+    <div id="modal-stack" style="margin-bottom:0.9rem;font-size:.75rem;color:var(--ghost)"></div>
+
+    <div id="modal-tags" style="display:flex;flex-wrap:wrap;gap:.3rem;margin-bottom:1.1rem"></div>
+
+    <div style="display:flex;gap:.5rem;font-size:.72rem;color:var(--muted);margin-bottom:1.25rem">
+      <span id="modal-files"></span>
+      <span>·</span>
+      <span id="modal-uses"></span>
+      <span>·</span>
+      <span id="modal-complexity"></span>
+    </div>
+
+    <div style="display:flex;gap:.65rem">
+      <button id="use-btn" class="btn btn-primary" style="flex:1;justify-content:center" onclick="useTemplate()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:.4rem"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        Use Template
+      </button>
+      <button class="btn btn-ghost btn-sm" onclick="closeModal()" style="flex-shrink:0">Cancel</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const API = '/api/v1';
+let state = {
+  page:       1,
+  perPage:    12,
+  total:      0,
+  appType:    '',
+  complexity: '',
+  search:     '',
+  loading:    false,
+  activeId:   null,
+};
+let searchTimer = null;
+
+const ICONS = {
+  web_app:      '🌐',
+  api:          '⚡',
+  landing_page: '🚀',
+  automation:   '🤖',
+  default:      '📦',
+};
+
+async function apiFetch(path, opts = {}) {
+  const r = await fetch(API + path, { credentials: 'include', ...opts });
+  if (r.status === 401) { window.location.href = '/login'; return null; }
+  return r;
+}
+
+// ── Load templates ────────────────────────────────────────────
+async function loadTemplates() {
+  if (state.loading) return;
+  state.loading = true;
+
+  const grid = document.getElementById('tmpl-grid');
+  grid.innerHTML = `<div class="state-box"><div class="state-box__icon" style="animation:spin 1s linear infinite">⏳</div><div class="state-box__text">Loading…</div></div>`;
+
+  const params = new URLSearchParams({
+    page:     state.page,
+    per_page: state.perPage,
+  });
+  if (state.appType)    params.set('app_type',   state.appType);
+  if (state.complexity) params.set('complexity', state.complexity);
+  if (state.search)     params.set('search',     state.search);
+
+  const res = await apiFetch(`/templates?${params}`);
+  state.loading = false;
+
+  if (!res?.ok) {
+    grid.innerHTML = `<div class="state-box"><div class="state-box__icon">⚠</div><div class="state-box__text">Failed to load templates.</div></div>`;
+    return;
+  }
+
+  const data = await res.json();
+  state.total = data.total;
+
+  renderCount(data.total);
+  renderGrid(data.templates);
+  renderPagination(data.total, data.page, data.per_page);
+}
+
+function renderCount(total) {
+  document.getElementById('result-count').textContent =
+    total ? `${total} template${total !== 1 ? 's' : ''}` : '';
+}
+
+function renderGrid(templates) {
+  const grid = document.getElementById('tmpl-grid');
+  if (!templates.length) {
+    grid.innerHTML = `<div class="state-box">
+      <div class="state-box__icon">🔍</div>
+      <div class="state-box__text">No templates found. Try a different search or filter.</div>
+    </div>`;
+    return;
+  }
+
+  grid.innerHTML = templates.map(t => {
+    const icon    = ICONS[t.app_type] || ICONS.default;
+    const stack   = [t.stack?.frontend, t.stack?.backend, t.stack?.database]
+                      .filter(Boolean).join(' · ');
+    const cmplxCls = `cmplx-${t.complexity}`;
+    const tagsHtml = (t.tags || []).slice(0,4)
+      .map(tag => `<span class="tmpl-tag">${tag}</span>`).join('');
+
+    return `<div class="tmpl-card" onclick="openModal(${JSON.stringify(t).replace(/"/g,'&quot;')})">
+      <div class="tmpl-card__icon">${icon}</div>
+      <div class="tmpl-card__name">${t.name}</div>
+      <div class="tmpl-card__desc">${t.description}</div>
+      <div class="tmpl-card__tags">${tagsHtml}</div>
+      <div class="tmpl-card__footer">
+        <span class="tmpl-card__stack">${stack || t.app_type}</span>
+        <span class="${cmplxCls}" style="font-size:.65rem;text-transform:uppercase;letter-spacing:.07em">${t.complexity}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderPagination(total, page, perPage) {
+  const pages    = Math.ceil(total / perPage);
+  const pagEl    = document.getElementById('pagination');
+  if (pages <= 1) { pagEl.style.display = 'none'; return; }
+  pagEl.style.display = 'flex';
+
+  let html = `<button class="page-btn" onclick="goPage(${page-1})" ${page<=1?'disabled':''}>‹</button>`;
+  for (let i = 1; i <= pages; i++) {
+    if (pages > 7 && Math.abs(i - page) > 2 && i !== 1 && i !== pages) {
+      if (i === 2 || i === pages - 1) html += `<span style="color:var(--muted);padding:0 4px">…</span>`;
+      continue;
+    }
+    html += `<button class="page-btn ${i===page?'current':''}" onclick="goPage(${i})">${i}</button>`;
+  }
+  html += `<button class="page-btn" onclick="goPage(${page+1})" ${page>=pages?'disabled':''}>›</button>`;
+  pagEl.innerHTML = html;
+}
+
+// ── Filters ───────────────────────────────────────────────────
+function setFilter(el, key, val) {
+  // Deactivate siblings in same group
+  document.querySelectorAll(`[data-filter="${key}"]`)
+    .forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  state[key === 'app_type' ? 'appType' : 'complexity'] = val;
+  state.page = 1;
+  loadTemplates();
+}
+
+function debounceSearch() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.search = document.getElementById('search-input').value.trim();
+    state.page   = 1;
+    loadTemplates();
+  }, 380);
+}
+
+function goPage(p) {
+  state.page = p;
+  loadTemplates();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ── Modal ─────────────────────────────────────────────────────
+function openModal(t) {
+  state.activeId = t.id;
+  const icon  = ICONS[t.app_type] || ICONS.default;
+  const stack = [t.stack?.frontend, t.stack?.backend, t.stack?.database]
+                  .filter(Boolean);
+
+  document.getElementById('modal-icon').textContent    = icon;
+  document.getElementById('modal-name').textContent    = t.name;
+  document.getElementById('modal-desc').textContent    = t.description;
+  document.getElementById('modal-files').textContent   = `${t.file_count || '?'} files`;
+  document.getElementById('modal-uses').textContent    = `${t.use_count || 0} uses`;
+  document.getElementById('modal-complexity').innerHTML =
+    `<span class="cmplx-${t.complexity}">${t.complexity}</span>`;
+
+  document.getElementById('modal-stack').innerHTML = stack.length
+    ? `<span style="color:var(--electric);font-family:var(--font-code)">${stack.join(' + ')}</span>`
+    : '';
+
+  document.getElementById('modal-tags').innerHTML = (t.tags || [])
+    .map(tag => `<span class="tmpl-tag">${tag}</span>`).join('');
+
+  document.getElementById('use-btn').disabled     = false;
+  document.getElementById('use-btn').textContent  = 'Use Template';
+
+  document.getElementById('use-modal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('use-modal').classList.remove('open');
+  state.activeId = null;
+}
+
+async function useTemplate() {
+  if (!state.activeId) return;
+  const btn   = document.getElementById('use-btn');
+  btn.disabled = true;
+  btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:spin 1s linear infinite;margin-right:.4rem"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>Creating project…`;
+
+  const res = await apiFetch(`/templates/${state.activeId}/use`, { method: 'POST' });
+  if (!res) return;
+
+  if (res.ok) {
+    const { redirect_url } = await res.json();
+    window.location.href = redirect_url;
+  } else {
+    const err = await res.json().catch(() => ({}));
+    btn.disabled = false;
+    btn.textContent = 'Use Template';
+    alert(err.detail || 'Failed to create project from template.');
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────
+loadTemplates();
+</script>
+{% endblock %}
