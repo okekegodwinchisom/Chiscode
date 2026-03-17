@@ -1,0 +1,474 @@
+{% extends "base.html" %}
+{% block title %}Billing — ChisCode{% endblock %}
+
+{% block head %}
+<style>
+.billing-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.billing-header {
+  text-align: center;
+  margin-bottom: 3rem;
+}
+
+.billing-header h1 {
+  font-family: var(--font-display);
+  font-size: 2.5rem;
+  font-weight: 800;
+  margin-bottom: 0.5rem;
+}
+
+.billing-header p {
+  color: var(--ghost);
+  font-size: 1rem;
+}
+
+.plans-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 2rem;
+  margin-top: 2rem;
+}
+
+.plan-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2rem;
+  position: relative;
+  transition: all 0.3s ease;
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-card:hover {
+  transform: translateY(-4px);
+  border-color: var(--electric);
+  box-shadow: 0 10px 30px rgba(0, 229, 255, 0.1);
+}
+
+.plan-card.popular {
+  border: 2px solid var(--electric);
+  background: var(--raised);
+}
+
+.popular-badge {
+  position: absolute;
+  top: -12px;
+  right: 20px;
+  background: var(--electric);
+  color: black;
+  padding: 0.25rem 1rem;
+  border-radius: 20px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.plan-name {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.plan-price {
+  font-size: 2rem;
+  font-weight: 800;
+  color: var(--electric);
+  margin-bottom: 1rem;
+}
+
+.plan-price span {
+  font-size: 0.9rem;
+  color: var(--ghost);
+  font-weight: 400;
+}
+
+.plan-features {
+  list-style: none;
+  padding: 0;
+  margin: 1.5rem 0;
+  flex-grow: 1;
+}
+
+.plan-features li {
+  padding: 0.5rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--silver);
+  font-size: 0.9rem;
+}
+
+.plan-features li::before {
+  content: "✓";
+  color: var(--neon);
+  font-weight: bold;
+  margin-right: 0.5rem;
+}
+
+.plan-features li.disabled {
+  color: var(--muted);
+}
+
+.plan-features li.disabled::before {
+  content: "✗";
+  color: var(--plasma);
+}
+
+.rate-limit {
+  background: var(--void);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  margin: 1rem 0;
+  text-align: center;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+}
+
+.rate-limit strong {
+  color: var(--electric);
+  font-size: 1.1rem;
+}
+
+.api-access {
+  display: inline-block;
+  background: rgba(0, 255, 160, 0.1);
+  color: var(--neon);
+  padding: 0.25rem 0.75rem;
+  border-radius: 20px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+
+.plan-btn {
+  width: 100%;
+  padding: 1rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  margin-top: 1rem;
+}
+
+.plan-btn.current {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--ghost);
+  cursor: not-allowed;
+}
+
+.plan-btn.upgrade {
+  background: var(--electric);
+  color: black;
+}
+
+.plan-btn.upgrade:hover {
+  background: #33e8ff;
+  transform: translateY(-2px);
+}
+
+.plan-btn.pro {
+  background: var(--electric);
+  color: black;
+}
+
+.plan-btn.yearly {
+  background: var(--neon);
+  color: black;
+}
+
+.plan-btn.yearly:hover {
+  background: #33ffb0;
+  transform: translateY(-2px);
+}
+
+.current-plan-badge {
+  text-align: center;
+  margin: 2rem 0;
+  padding: 1rem;
+  background: var(--raised);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.loading {
+  text-align: center;
+  color: var(--ghost);
+  padding: 2rem;
+}
+
+/* Comparison Table */
+.comparison-section {
+  margin-top: 4rem;
+}
+
+.comparison-section h2 {
+  text-align: center;
+  margin-bottom: 2rem;
+  font-family: var(--font-display);
+  font-size: 2rem;
+}
+
+.comparison-table {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.comparison-row {
+  display: grid;
+  grid-template-columns: 200px 1fr 1fr 1fr 1fr;
+  border-bottom: 1px solid var(--border);
+}
+
+.comparison-row:last-child {
+  border-bottom: none;
+}
+
+.comparison-row.header {
+  background: var(--raised);
+  font-weight: 700;
+}
+
+.comparison-cell {
+  padding: 1rem;
+  text-align: center;
+}
+
+.comparison-cell:first-child {
+  text-align: left;
+  font-weight: 600;
+}
+
+.comparison-cell.yes {
+  color: var(--neon);
+}
+
+.comparison-cell.no {
+  color: var(--plasma);
+}
+
+@media (max-width: 768px) {
+  .plans-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .comparison-row {
+    grid-template-columns: 120px 1fr 1fr 1fr 1fr;
+    font-size: 0.8rem;
+  }
+}
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="billing-container">
+  <div class="billing-header">
+    <h1>Choose Your Plan</h1>
+    <p>Scale your AI development with the right plan for your needs</p>
+  </div>
+
+  <!-- Current Plan Display -->
+  <div id="current-plan-display" class="current-plan-badge">
+    <div class="loading">Loading your current plan...</div>
+  </div>
+
+  <!-- Plans Grid -->
+  <div class="plans-grid">
+    <!-- Free Tier -->
+    <div class="plan-card">
+      <div class="plan-name">Free</div>
+      <div class="plan-price">$0<span>/month</span></div>
+      <div class="rate-limit">
+        <strong>5 requests/day</strong>
+      </div>
+      <ul class="plan-features">
+        <li>5 requests per day</li>
+        <li>Basic support</li>
+        <li>Community access</li>
+        <li class="disabled">API access</li>
+        <li class="disabled">Priority support</li>
+      </ul>
+      <button class="plan-btn current" disabled>Current Plan</button>
+    </div>
+
+    <!-- Basic Plan -->
+    <div class="plan-card">
+      <div class="plan-name">Basic</div>
+      <div class="plan-price">$25<span>/month</span></div>
+      <div class="rate-limit">
+        <strong>100 requests/day</strong>
+      </div>
+      <ul class="plan-features">
+        <li>100 requests per day</li>
+        <li>Priority email support</li>
+        <li>Basic analytics</li>
+        <li class="disabled">API access</li>
+        <li class="disabled">Advanced features</li>
+      </ul>
+      <button class="plan-btn upgrade" onclick="upgradePlan('basic')">Upgrade to Basic</button>
+    </div>
+
+    <!-- Pro Plan (Popular) -->
+    <div class="plan-card popular">
+      <div class="popular-badge">MOST POPULAR</div>
+      <div class="plan-name">Pro</div>
+      <div class="plan-price">$120<span>/month</span></div>
+      <div class="rate-limit">
+        <strong>1000 requests/day</strong>
+      </div>
+      <span class="api-access">✓ API Access Included</span>
+      <ul class="plan-features">
+        <li>1000 requests per day</li>
+        <li>Full API access</li>
+        <li>Priority 24/7 support</li>
+        <li>Advanced analytics</li>
+        <li>Custom integrations</li>
+      </ul>
+      <button class="plan-btn pro" onclick="upgradePlan('pro')">Upgrade to Pro</button>
+    </div>
+
+    <!-- Yearly Plan -->
+    <div class="plan-card">
+      <div class="plan-name">Yearly</div>
+      <div class="plan-price">$1000<span>/year</span></div>
+      <div class="rate-limit">
+        <strong>1000 requests/day</strong>
+      </div>
+      <span class="api-access">✓ API Access Included</span>
+      <ul class="plan-features">
+        <li>1000 requests per day</li>
+        <li>Full API access</li>
+        <li>Priority 24/7 support</li>
+        <li>Advanced analytics</li>
+        <li>Custom integrations</li>
+        <li>Save $440/year</li>
+      </ul>
+      <button class="plan-btn yearly" onclick="upgradePlan('yearly')">Upgrade to Yearly</button>
+    </div>
+  </div>
+
+  <!-- Comparison Table -->
+  <div class="comparison-section">
+    <h2>Compare Plans</h2>
+    <div class="comparison-table">
+      <div class="comparison-row header">
+        <div class="comparison-cell">Feature</div>
+        <div class="comparison-cell">Free</div>
+        <div class="comparison-cell">Basic</div>
+        <div class="comparison-cell">Pro</div>
+        <div class="comparison-cell">Yearly</div>
+      </div>
+      
+      <div class="comparison-row">
+        <div class="comparison-cell">Price</div>
+        <div class="comparison-cell">$0/month</div>
+        <div class="comparison-cell">$25/month</div>
+        <div class="comparison-cell">$120/month</div>
+        <div class="comparison-cell">$1000/year</div>
+      </div>
+      
+      <div class="comparison-row">
+        <div class="comparison-cell">Daily Requests</div>
+        <div class="comparison-cell">5</div>
+        <div class="comparison-cell">100</div>
+        <div class="comparison-cell">1000</div>
+        <div class="comparison-cell">1000</div>
+      </div>
+      
+      <div class="comparison-row">
+        <div class="comparison-cell">API Access</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell yes">✓</div>
+        <div class="comparison-cell yes">✓</div>
+      </div>
+      
+      <div class="comparison-row">
+        <div class="comparison-cell">Priority Support</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell yes">✓</div>
+        <div class="comparison-cell yes">✓</div>
+        <div class="comparison-cell yes">✓</div>
+      </div>
+      
+      <div class="comparison-row">
+        <div class="comparison-cell">Advanced Analytics</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell yes">✓</div>
+        <div class="comparison-cell yes">✓</div>
+      </div>
+      
+      <div class="comparison-row">
+        <div class="comparison-cell">Custom Integrations</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell no">✗</div>
+        <div class="comparison-cell yes">✓</div>
+        <div class="comparison-cell yes">✓</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Load current user plan
+async function loadCurrentPlan() {
+  try {
+    const response = await fetch('/api/v1/users/me', {
+      credentials: 'include'
+    });
+    
+    if (response.ok) {
+      const user = await response.json();
+      const currentPlan = user.plan;
+      
+      // Update current plan display
+      document.getElementById('current-plan-display').innerHTML = `
+        <strong>Your Current Plan:</strong> ${currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} 
+        (${currentPlan === 'free' ? '5' : currentPlan === 'basic' ? '100' : '1000'} requests/day)
+      `;
+      
+      // Update button states based on current plan
+      updateButtonStates(currentPlan);
+    }
+  } catch (error) {
+    console.error('Failed to load plan:', error);
+  }
+}
+
+// Update button states based on current plan
+function updateButtonStates(currentPlan) {
+  const buttons = document.querySelectorAll('.plan-btn');
+  buttons.forEach(btn => {
+    if (btn.textContent.toLowerCase().includes(currentPlan)) {
+      btn.textContent = 'Current Plan';
+      btn.classList.add('current');
+      btn.classList.remove('upgrade', 'pro', 'yearly');
+      btn.disabled = true;
+    }
+  });
+}
+
+// Handle upgrade clicks
+async function upgradePlan(plan) {
+  // This would integrate with your payment provider (Stripe/RevenueCat)
+  alert(`Upgrading to ${plan} plan - This will be integrated with your payment provider`);
+  
+  // Example redirect to payment page
+  // window.location.href = `/checkout?plan=${plan}`;
+}
+
+// Load plan on page load
+document.addEventListener('DOMContentLoaded', loadCurrentPlan);
+</script>
+{% endblock %}
