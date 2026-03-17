@@ -1,0 +1,552 @@
+{% extends "base.html" %}
+{% block title %}ChisCode — AI Agent Builder{% endblock %}
+{% block description %}Transform plain English into production-ready web apps. AI-powered code generation with GitHub integration, live preview, and one-click deployment.{% endblock %}
+
+{% block head %}
+<style>
+/* ── Landing-specific styles ── */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 6rem 2rem 4rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero__grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--border-dim) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border-dim) 1px, transparent 1px);
+  background-size: 56px 56px;
+  opacity: .6;
+  mask-image: radial-gradient(ellipse 80% 70% at 50% 50%, black 40%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 70% at 50% 50%, black 40%, transparent 100%);
+}
+
+.hero__orb {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+  filter: blur(80px);
+}
+.hero__orb--1 {
+  width: 500px; height: 500px;
+  background: radial-gradient(circle, rgba(0,229,255,.12) 0%, transparent 70%);
+  top: 10%; left: 50%; transform: translateX(-50%);
+}
+.hero__orb--2 {
+  width: 300px; height: 300px;
+  background: radial-gradient(circle, rgba(157,110,255,.1) 0%, transparent 70%);
+  top: 50%; left: 15%;
+}
+.hero__orb--3 {
+  width: 250px; height: 250px;
+  background: radial-gradient(circle, rgba(57,255,20,.06) 0%, transparent 70%);
+  top: 30%; right: 10%;
+}
+
+.hero__inner { position: relative; z-index: 1; max-width: 800px; }
+
+.hero__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .32rem 1rem;
+  background: rgba(0,229,255,.06);
+  border: 1px solid rgba(0,229,255,.18);
+  border-radius: 99px;
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--electric);
+  margin-bottom: 1.75rem;
+}
+.hero__pill-dot {
+  width: 6px; height: 6px;
+  background: var(--electric);
+  border-radius: 50%;
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+.hero__title {
+  font-size: clamp(2.8rem, 7vw, 5.5rem);
+  font-weight: 800;
+  letter-spacing: -.04em;
+  line-height: 1.04;
+  color: var(--white);
+  margin-bottom: 1.5rem;
+}
+.hero__title em {
+  font-style: normal;
+  color: var(--electric);
+  text-shadow: 0 0 40px rgba(0,229,255,.3);
+}
+
+.hero__sub {
+  font-size: clamp(.95rem, 2vw, 1.2rem);
+  color: var(--ghost);
+  line-height: 1.7;
+  max-width: 580px;
+  margin: 0 auto 2.5rem;
+}
+
+.hero__cta {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-bottom: 4rem;
+}
+
+/* Demo prompt */
+.demo-card {
+  background: rgba(13,16,24,.8);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem 1.5rem;
+  text-align: left;
+  backdrop-filter: blur(12px);
+  max-width: 640px;
+  margin: 0 auto;
+}
+.demo-card__row {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+.demo-card__avatar {
+  width: 34px; height: 34px;
+  background: rgba(0,229,255,.1);
+  border: 1px solid rgba(0,229,255,.2);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-size: 1rem;
+}
+.demo-card__text {
+  font-family: var(--font-code);
+  font-size: .8rem;
+  line-height: 1.65;
+  color: var(--silver);
+}
+.demo-card__text em { color: var(--electric); font-style: normal; }
+.demo-card__footer {
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+  margin-top: .9rem;
+  padding-top: .9rem;
+  border-top: 1px solid var(--border-dim);
+}
+
+/* Features */
+.features { padding: 6rem 2rem; }
+.features__inner { max-width: 1100px; margin: 0 auto; }
+.section-eyebrow {
+  font-size: .68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .15em;
+  color: var(--electric);
+  margin-bottom: .75rem;
+  display: block;
+}
+.section-title {
+  font-size: clamp(1.8rem, 4vw, 2.8rem);
+  font-weight: 800;
+  letter-spacing: -.03em;
+  line-height: 1.1;
+  color: var(--white);
+}
+.features__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.25rem;
+  margin-top: 3rem;
+}
+.feature-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.75rem;
+  transition: all .2s var(--ease-snap);
+  position: relative;
+  overflow: hidden;
+}
+.feature-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--electric), transparent);
+  opacity: 0;
+  transition: opacity .3s ease;
+}
+.feature-card:hover {
+  border-color: var(--border-bright);
+  transform: translateY(-3px);
+  box-shadow: 0 16px 48px rgba(0,0,0,.5);
+}
+.feature-card:hover::before { opacity: 1; }
+.feature-card__icon {
+  width: 42px; height: 42px;
+  background: rgba(0,229,255,.08);
+  border: 1px solid rgba(0,229,255,.15);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.1rem;
+  margin-bottom: 1rem;
+}
+.feature-card__title {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--white);
+  margin-bottom: .5rem;
+}
+.feature-card__desc {
+  font-size: .82rem;
+  color: var(--ghost);
+  line-height: 1.7;
+}
+
+/* How it works */
+.how { padding: 5rem 2rem; background: linear-gradient(180deg, transparent, rgba(0,229,255,.02), transparent); }
+.how__inner { max-width: 900px; margin: 0 auto; }
+.steps { display: flex; flex-direction: column; gap: 0; margin-top: 3rem; position: relative; }
+.steps::before {
+  content: '';
+  position: absolute;
+  left: 20px; top: 0; bottom: 0;
+  width: 1px;
+  background: linear-gradient(180deg, var(--electric), var(--violet), transparent);
+  opacity: .3;
+}
+.step {
+  display: flex;
+  gap: 1.5rem;
+  padding: 1.5rem 0 1.5rem 1rem;
+  position: relative;
+}
+.step__num {
+  width: 40px; height: 40px;
+  background: var(--void);
+  border: 1px solid rgba(0,229,255,.3);
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-display);
+  font-size: .75rem;
+  font-weight: 800;
+  color: var(--electric);
+  flex-shrink: 0;
+  box-shadow: 0 0 16px rgba(0,229,255,.15);
+  z-index: 1;
+}
+.step__title {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--white);
+  margin-bottom: .35rem;
+}
+.step__desc { font-size: .83rem; color: var(--ghost); line-height: 1.7; }
+
+/* Pricing */
+.pricing { padding: 6rem 2rem; }
+.pricing__inner { max-width: 1060px; margin: 0 auto; }
+.pricing__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1.25rem;
+  margin-top: 3rem;
+}
+.plan {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  transition: all .2s ease;
+}
+.plan:hover { border-color: var(--border-bright); transform: translateY(-2px); }
+.plan--featured {
+  border-color: rgba(0,229,255,.35);
+  background: rgba(0,229,255,.025);
+  box-shadow: 0 0 40px rgba(0,229,255,.06), 0 0 0 1px rgba(0,229,255,.08);
+}
+.plan__name {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--white);
+  margin-bottom: .25rem;
+}
+.plan__price {
+  font-family: var(--font-display);
+  font-size: 2.4rem;
+  font-weight: 800;
+  color: var(--electric);
+  line-height: 1;
+  margin: .5rem 0;
+}
+.plan__price sup { font-size: 1rem; vertical-align: top; margin-top: .5rem; }
+.plan__price sub { font-size: .9rem; color: var(--ghost); font-weight: 400; }
+.plan__limit { font-size: .75rem; color: var(--ghost); padding-bottom: 1.1rem; border-bottom: 1px solid var(--border-dim); margin-bottom: 1.1rem; }
+.plan__features { list-style: none; display: flex; flex-direction: column; gap: .55rem; flex: 1; margin-bottom: 1.5rem; }
+.plan__feature {
+  font-size: .8rem;
+  color: var(--silver);
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+.plan__feature::before { content: '→'; color: var(--electric); flex-shrink: 0; font-size: .75rem; }
+
+/* CTA strip */
+.cta-strip {
+  max-width: 780px;
+  margin: 5rem auto;
+  padding: 0 2rem;
+}
+.cta-strip__inner {
+  background: linear-gradient(135deg, rgba(0,229,255,.06) 0%, rgba(157,110,255,.06) 100%);
+  border: 1px solid rgba(0,229,255,.15);
+  border-radius: 18px;
+  padding: 3.5rem 2.5rem;
+  text-align: center;
+}
+.cta-strip h2 { margin-bottom: .75rem; }
+.cta-strip p { margin-bottom: 2rem; }
+
+/* Footer */
+footer {
+  border-top: 1px solid var(--border-dim);
+  padding: 1.5rem 2rem;
+  text-align: center;
+  font-size: .72rem;
+  color: var(--muted);
+}
+</style>
+{% endblock %}
+
+{% block body %}
+
+<!-- Nav -->
+<nav class="nav">
+  <a href="/" class="nav__logo">Chis<em>Code</em></a>
+  <span class="nav__spacer"></span>
+  <div class="nav__links">
+    <a href="#features" class="nav__link">Features</a>
+    <a href="#how"      class="nav__link">How It Works</a>
+    <a href="#pricing"  class="nav__link">Pricing</a>
+    <a href="/login"    class="nav__link">Log In</a>
+    <a href="/register" class="btn btn-primary btn-sm" style="margin-left:.25rem">Get Started</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="hero__grid"></div>
+  <div class="hero__orb hero__orb--1"></div>
+  <div class="hero__orb hero__orb--2"></div>
+  <div class="hero__orb hero__orb--3"></div>
+
+  <div class="hero__inner">
+    <div class="hero__pill reveal">
+      <span class="hero__pill-dot"></span>
+      Beta — AI-Powered Code Generation
+    </div>
+
+    <h1 class="hero__title reveal reveal-1">
+      Describe it.<br><em>We build it.</em>
+    </h1>
+
+    <p class="hero__sub reveal reveal-2">
+      ChisCode turns plain-English descriptions into complete, production-ready
+      web applications — with version control, live preview, and one-click deployment.
+    </p>
+
+    <div class="hero__cta reveal reveal-3">
+      <a href="/register" class="btn btn-primary btn-xl">Start Building Free</a>
+      <a href="#how"      class="btn btn-ghost   btn-xl">See How It Works</a>
+    </div>
+
+    <!-- Demo prompt card -->
+    <div class="demo-card reveal reveal-4">
+      <div class="demo-card__row">
+        <div class="demo-card__avatar">💬</div>
+        <div class="demo-card__text">
+          "Build a <em>SaaS dashboard</em> with user auth, a <em>PostgreSQL</em> backend,
+          Stripe billing, and an analytics page showing MRR and churn charts.
+          Use <em>Next.js</em> on the frontend and <em>FastAPI</em> for the API."
+        </div>
+      </div>
+      <div class="demo-card__footer">
+        <div class="progress" style="flex:1">
+          <div class="progress__fill" style="width:100%"></div>
+        </div>
+        <span class="badge badge-neon">
+          <span style="width:6px;height:6px;background:var(--neon);border-radius:50%;display:inline-block"></span>
+          Complete
+        </span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section class="features" id="features">
+  <div class="features__inner">
+    <div style="text-align:center; margin-bottom:.5rem">
+      <span class="section-eyebrow">Capabilities</span>
+      <h2 class="section-title">Everything you need.<br>Nothing you don't.</h2>
+    </div>
+
+    <div class="features__grid">
+      {% set features = [
+        ("⚡", "Natural Language → Code",   "Describe your app in plain English. ChisCode picks the optimal stack and generates a complete, runnable codebase in minutes."),
+        ("🔄", "Self-Healing Agent",         "The Katana Pattern detects lint errors and test failures in generated code, then automatically re-prompts to fix them — up to 3 cycles."),
+        ("🐙", "GitHub Integration",         "Every project is version-controlled from the first commit. Review diffs, open PRs, and roll back to any version with one click."),
+        ("👁️", "Live Preview",               "Generated apps run in a secure gVisor sandbox. Playwright captures screenshots so you review before committing anything."),
+        ("🚀", "One-Click Deploy",           "Push to Vercel, Netlify, Fly.io, Render, AWS, or GCP directly from the dashboard — no CLI required."),
+        ("👥", "Collaborative",              "Invite teammates, assign roles, see real-time presence, and lock iterations to prevent conflicts."),
+      ] %}
+      {% for icon, title, desc in features %}
+      <div class="feature-card reveal reveal-{{ loop.index }}">
+        <div class="feature-card__icon">{{ icon }}</div>
+        <div class="feature-card__title">{{ title }}</div>
+        <p class="feature-card__desc">{{ desc }}</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<!-- How It Works -->
+<section class="how" id="how">
+  <div class="how__inner">
+    <span class="section-eyebrow">Process</span>
+    <h2 class="section-title">From prompt to production<br>in four steps.</h2>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step__num">01</div>
+        <div>
+          <div class="step__title">Describe your app</div>
+          <p class="step__desc">Write what you want in plain English. Be as detailed or as vague as you like — the agent will ask for clarification if needed.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step__num">02</div>
+        <div>
+          <div class="step__title">Agent generates & self-heals</div>
+          <p class="step__desc">The LangGraph agent analyzes requirements, picks a tech stack, generates all files, runs quality checks, and fixes any errors automatically.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step__num">03</div>
+        <div>
+          <div class="step__title">Review live preview</div>
+          <p class="step__desc">Your app runs in a sandboxed environment. Browse it, request changes, or approve it to commit to your GitHub repository.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step__num">04</div>
+        <div>
+          <div class="step__title">Deploy anywhere</div>
+          <p class="step__desc">One click pushes to your platform of choice — Vercel, Fly.io, AWS, GCP, Render, Netlify, or Cloudflare Pages.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Pricing -->
+<section class="pricing" id="pricing">
+  <div class="pricing__inner">
+    <div style="text-align:center">
+      <span class="section-eyebrow">Pricing</span>
+      <h2 class="section-title">Simple, transparent pricing.</h2>
+      <p style="margin-top:.75rem; color:var(--ghost); font-size:.9rem">Start free. Scale when you need to.</p>
+    </div>
+
+    <div class="pricing__grid">
+      <div class="plan reveal reveal-1">
+        <div class="plan__name">Free</div>
+        <div class="plan__price"><sup>$</sup>0</div>
+        <div class="plan__limit">5 requests / day · forever</div>
+        <ul class="plan__features">
+          <li class="plan__feature">All core frameworks</li>
+          <li class="plan__feature">GitHub export</li>
+          <li class="plan__feature">ZIP download</li>
+        </ul>
+        <a href="/register" class="btn btn-ghost btn-full">Get Started</a>
+      </div>
+
+      <div class="plan plan--featured reveal reveal-2">
+        <div style="margin-bottom:.75rem"><span class="badge badge-electric">Most Popular</span></div>
+        <div class="plan__name">Basic</div>
+        <div class="plan__price"><sup>$</sup>25<sub>/mo</sub></div>
+        <div class="plan__limit">100 requests / day</div>
+        <ul class="plan__features">
+          <li class="plan__feature">Everything in Free</li>
+          <li class="plan__feature">All deployment platforms</li>
+          <li class="plan__feature">Live preview</li>
+          <li class="plan__feature">Version history</li>
+        </ul>
+        <a href="/register?plan=basic" class="btn btn-primary btn-full">Start Basic</a>
+      </div>
+
+      <div class="plan reveal reveal-3">
+        <div class="plan__name">Pro</div>
+        <div class="plan__price"><sup>$</sup>120<sub>/mo</sub></div>
+        <div class="plan__limit">1,000 requests / day</div>
+        <ul class="plan__features">
+          <li class="plan__feature">Everything in Basic</li>
+          <li class="plan__feature">API key access</li>
+          <li class="plan__feature">Priority generation</li>
+          <li class="plan__feature">Collaborative projects</li>
+        </ul>
+        <a href="/register?plan=pro" class="btn btn-secondary btn-full">Go Pro</a>
+      </div>
+
+      <div class="plan reveal reveal-4">
+        <div class="plan__name">Yearly</div>
+        <div class="plan__price"><sup>$</sup>1k<sub>/yr</sub></div>
+        <div class="plan__limit">1,000 requests / day</div>
+        <ul class="plan__features">
+          <li class="plan__feature">Everything in Pro</li>
+          <li class="plan__feature">2 months free</li>
+          <li class="plan__feature">Priority support</li>
+          <li class="plan__feature">Early feature access</li>
+        </ul>
+        <a href="/register?plan=yearly" class="btn btn-ghost btn-full">Go Yearly</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA strip -->
+<div class="cta-strip">
+  <div class="cta-strip__inner reveal">
+    <h2>Ready to build?</h2>
+    <p>5 free requests every day. No credit card required.</p>
+    <a href="/register" class="btn btn-primary btn-xl">Create Free Account</a>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer>
+  <p>&copy; {{ app_version and "2025" or "2025" }} ChisCode &nbsp;·&nbsp; Built with ⚡ and too much coffee.</p>
+</footer>
+
+{% endblock %}
+    
