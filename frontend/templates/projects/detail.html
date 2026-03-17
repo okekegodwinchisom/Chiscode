@@ -1,0 +1,735 @@
+{% extends "base.html" %}
+{% block title %}Project — ChisCode{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
+<!-- JSZip for real .zip export -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+<style>
+  /* ── Layout ─────────────────────────────────────────────── */
+  .viewer { display: grid; grid-template-columns: 272px 1fr; height: calc(100vh - var(--nav-h)); overflow: hidden; }
+  @media (max-width: 768px) { .viewer { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } }
+
+  /* ── File tree ──────────────────────────────────────────── */
+  .filetree { border-right: 1px solid var(--border); overflow-y: auto; background: var(--deep); display: flex; flex-direction: column; }
+  .filetree__header { padding: 1rem 1.25rem 0.75rem; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .filetree__name { font-family: var(--font-display); font-size: 0.9rem; font-weight: 700; color: var(--white); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .filetree__meta { font-size: 0.7rem; color: var(--ghost); margin-top: 0.2rem; }
+  .filetree__list { flex: 1; overflow-y: auto; padding: 0.5rem 0; }
+  .filetree__dir  { padding: 0.4rem 1.25rem 0.15rem; font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); margin-top: 0.5rem; }
+  .filetree__file { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 1.25rem; cursor: pointer; font-size: 0.8rem; color: var(--ghost); font-family: var(--font-code); transition: all 0.1s ease; border-left: 2px solid transparent; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .filetree__file:hover { background: var(--surface); color: var(--white); }
+  .filetree__file--active { background: rgba(0,229,255,0.07); color: var(--electric); border-left-color: var(--electric); }
+  .filetree__file-icon { font-size: 0.85rem; flex-shrink: 0; }
+
+  /* ── Info panel ─────────────────────────────────────────── */
+  .info-panel { padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: 1fr 1fr; gap: 0.65rem; }
+  .info-item__label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); margin-bottom: 0.15rem; font-weight: 700; }
+  .info-item__value { font-size: 0.8rem; color: var(--white); font-weight: 600; }
+
+  /* ── Action buttons ─────────────────────────────────────── */
+  .filetree__actions { padding: 0.75rem 1rem; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 0.4rem; flex-shrink: 0; }
+  .action-row { display: flex; gap: 0.4rem; }
+  .action-row .btn { flex: 1; justify-content: center; font-size: 0.75rem; padding: 0.45rem 0.5rem; }
+
+  /* ── Code viewer ────────────────────────────────────────── */
+  .codeview { display: flex; flex-direction: column; overflow: hidden; background: var(--void); }
+  .codeview__tabs { display: flex; align-items: center; border-bottom: 1px solid var(--border); background: var(--deep); padding: 0 0.5rem; gap: 0.25rem; overflow-x: auto; min-height: 42px; flex-shrink: 0; }
+  .codeview__tab { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem 0.85rem; font-size: 0.75rem; font-family: var(--font-code); color: var(--ghost); cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.1s ease; }
+  .codeview__tab:hover { color: var(--white); }
+  .codeview__tab--active { color: var(--white); border-bottom-color: var(--electric); }
+  .codeview__tab-close { opacity: 0; font-size: 0.8rem; line-height: 1; padding: 0.1rem 0.15rem; border-radius: 2px; transition: opacity 0.1s; }
+  .codeview__tab:hover .codeview__tab-close { opacity: 0.5; }
+  .codeview__tab-close:hover { opacity: 1 !important; background: var(--raised); }
+  .codeview__toolbar { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); background: var(--deep); flex-shrink: 0; min-height: 42px; }
+  .codeview__filepath { font-size: 0.72rem; font-family: var(--font-code); color: var(--ghost); }
+  .codeview__toolbar-actions { display: flex; gap: 0.5rem; }
+  .codeview__body { flex: 1; overflow: auto; position: relative; }
+  .codeview__empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--muted); text-align: center; padding: 2rem; }
+  .codeview__empty-icon { font-size: 3rem; margin-bottom: 1rem; opacity: 0.4; }
+
+  /* Code block */
+  .codeview__body pre { margin: 0; border-radius: 0; }
+  .codeview__body pre code.hljs { padding: 1.5rem; font-family: var(--font-code); font-size: 0.82rem; line-height: 1.65; background: var(--void) !important; min-height: 100%; }
+  .codeview__body .hljs { background: var(--void) !important; }
+  .line-numbers-wrapper { display: flex; }
+  .line-numbers { padding: 1.5rem 0.75rem 1.5rem 1.5rem; font-family: var(--font-code); font-size: 0.82rem; line-height: 1.65; color: var(--muted); text-align: right; user-select: none; background: var(--void); border-right: 1px solid var(--border); flex-shrink: 0; min-width: 3rem; }
+  .line-numbers-code { flex: 1; overflow: auto; }
+
+  /* Status pill */
+  .status-pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.25rem 0.65rem; border-radius: 99px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+  .status-pill::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* Export progress */
+  .export-progress { display: none; align-items: center; gap: 0.5rem; font-size: 0.75rem; color: var(--ghost); padding: 0.4rem 0; }
+  .export-progress.show { display: flex; }
+
+  /* Delete confirm */
+  .delete-confirm { display: none; background: rgba(255,61,107,0.08); border: 1px solid rgba(255,61,107,0.3); border-radius: 8px; padding: 0.75rem 1rem; margin-top: 0.25rem; }
+  .delete-confirm.show { display: block; }
+
+  /* Copy flash */
+  @keyframes copy-flash { 0%,100% { color: var(--ghost); } 50% { color: var(--neon); } }
+  .copy-flash { animation: copy-flash 0.7s ease forwards; }
+
+  /* Upgrade modal */
+  .plan-card { border: 2px solid var(--border); border-radius: 12px; padding: 1.25rem; cursor: pointer; transition: all 0.15s; background: var(--raised); }
+  .plan-card:hover { border-color: var(--electric); background: rgba(0,229,255,0.04); }
+  .plan-card.featured { border-color: var(--neon); background: rgba(57,255,20,0.04); }
+  .plan-card__name { font-family: var(--font-display); font-size: 1.1rem; font-weight: 800; }
+  .plan-card__price { font-size: 1.75rem; font-weight: 800; color: var(--white); margin: 0.35rem 0; }
+  .plan-card__price span { font-size: 0.8rem; color: var(--ghost); font-weight: 400; }
+  .plan-card__feature { font-size: 0.78rem; color: var(--ghost); padding: 0.2rem 0; }
+  .plan-card__feature::before { content: '✓ '; color: var(--neon); }
+</style>
+{% endblock %}
+
+{% block body %}
+<!-- Nav -->
+<nav class="nav">
+  <a href="/dashboard" style="display:flex;align-items:center;gap:0.4rem;color:var(--ghost);font-size:0.8rem;text-decoration:none;margin-right:1rem;white-space:nowrap">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+    Dashboard
+  </a>
+  <a href="/" class="nav__logo">Chis<span>Code</span></a>
+  <div class="nav__links">
+    <span id="proj-status-badge" class="status-pill" style="font-size:0.7rem">Loading</span>
+    <span class="badge badge-ghost" id="plan-badge" style="cursor:pointer" onclick="openUpgradeModal()">Free</span>
+  </div>
+</nav>
+
+<!-- Viewer -->
+<div class="viewer">
+
+  <!-- ── File Tree ── -->
+  <div class="filetree">
+    <div class="filetree__header">
+      <div class="filetree__name" id="proj-name">Loading…</div>
+      <div class="filetree__meta" id="proj-meta">—</div>
+    </div>
+
+    <div class="info-panel" id="proj-info" style="display:none">
+      <div class="info-item">
+        <div class="info-item__label">Files</div>
+        <div class="info-item__value" id="info-files">—</div>
+      </div>
+      <div class="info-item">
+        <div class="info-item__label">Version</div>
+        <div class="info-item__value" id="info-version">—</div>
+      </div>
+      <div class="info-item">
+        <div class="info-item__label">Stack</div>
+        <div class="info-item__value" id="info-stack" style="font-size:0.7rem;line-height:1.4">—</div>
+      </div>
+      <div class="info-item">
+        <div class="info-item__label">Created</div>
+        <div class="info-item__value" id="info-date" style="font-size:0.72rem">—</div>
+      </div>
+    </div>
+
+    <div class="filetree__list" id="file-list">
+      <div style="padding:1rem 1.25rem">
+        <div class="skeleton" style="height:28px;margin-bottom:6px;border-radius:4px"></div>
+        <div class="skeleton" style="height:28px;margin-bottom:6px;border-radius:4px"></div>
+        <div class="skeleton" style="height:28px;margin-bottom:6px;border-radius:4px"></div>
+        <div class="skeleton" style="height:28px;margin-bottom:6px;border-radius:4px"></div>
+        <div class="skeleton" style="height:28px;border-radius:4px"></div>
+      </div>
+    </div>
+
+    <!-- Action buttons -->
+    <div class="filetree__actions">
+
+      <!-- Iterate -->
+      <button class="btn btn-primary btn-sm" style="justify-content:center;width:100%" onclick="openIterateModal()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:0.35rem"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        Iterate Project
+      </button>
+
+      <!-- Deploy + Preview buttons (shown when status=complete) -->
+      <div id="deploy-preview-row" style="display:none;flex-direction:column;gap:.4rem">
+        <a id="deploy-btn" href="#" class="btn btn-primary btn-sm"
+           style="justify-content:center;width:100%;text-decoration:none">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:.35rem"><path d="M22 2L11 13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          Deploy App
+        </a>
+        <a id="preview-btn" href="#" class="btn btn-ghost btn-sm"
+           style="justify-content:center;width:100%;text-decoration:none">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:.35rem"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          Preview
+        </a>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-ghost btn-sm" onclick="exportZip()" id="export-btn" title="Download all files as .zip">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:0.3rem"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export .zip
+        </button>
+        <button class="btn btn-ghost btn-sm" onclick="copyCurrentFile()" title="Copy active file to clipboard">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy
+        </button>
+      </div>
+
+      <!-- GitHub link (shown when available) -->
+      <div id="github-link-row" style="display:none">
+        <a id="github-link" href="#" target="_blank" class="btn btn-ghost btn-sm" style="width:100%;justify-content:center;text-decoration:none">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:0.3rem"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+          Open on GitHub
+        </a>
+      </div>
+
+      <!-- Export progress indicator -->
+      <div class="export-progress" id="export-progress">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--electric)" stroke-width="2" style="animation:spin 1s linear infinite"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+        <span id="export-progress-text">Building zip…</span>
+      </div>
+
+      <!-- Delete section -->
+      <div style="border-top:1px solid var(--border);padding-top:0.5rem;margin-top:0.1rem">
+        <button class="btn btn-sm" style="width:100%;justify-content:center;color:var(--plasma);border-color:rgba(255,61,107,0.25);background:rgba(255,61,107,0.06)" onclick="toggleDeleteConfirm()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:0.3rem"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          Delete Project
+        </button>
+        <div class="delete-confirm" id="delete-confirm">
+          <p style="font-size:0.78rem;color:var(--plasma);margin-bottom:0.65rem;font-weight:600">⚠ This cannot be undone.</p>
+          <p style="font-size:0.74rem;color:var(--ghost);margin-bottom:0.75rem">All generated files will be permanently deleted. The GitHub repository (if any) will remain.</p>
+          <div style="display:flex;gap:0.5rem">
+            <button class="btn btn-sm" style="flex:1;justify-content:center;background:var(--plasma);color:#fff;border-color:var(--plasma)" onclick="deleteProject()">Yes, delete</button>
+            <button class="btn btn-ghost btn-sm" style="flex:1;justify-content:center" onclick="toggleDeleteConfirm()">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Code Viewer ── -->
+  <div class="codeview">
+    <div class="codeview__tabs" id="tabs-bar"></div>
+
+    <div class="codeview__toolbar" id="toolbar" style="display:none">
+      <span class="codeview__filepath" id="current-filepath"></span>
+      <div class="codeview__toolbar-actions">
+        <button class="btn btn-ghost btn-sm" id="copy-btn" onclick="copyCurrentFile()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy
+        </button>
+        <button class="btn btn-ghost btn-sm" onclick="downloadFile()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download
+        </button>
+      </div>
+    </div>
+
+    <div class="codeview__body" id="code-body">
+      <div class="codeview__empty">
+        <div class="codeview__empty-icon">📂</div>
+        <p style="font-size:0.9rem;color:var(--ghost)">Select a file from the tree</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     UPGRADE MODAL
+     ═══════════════════════════════════════════ -->
+<div id="upgrade-modal" style="display:none;position:fixed;inset:0;z-index:300;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);align-items:center;justify-content:center;padding:1.5rem;overflow-y:auto" onclick="if(event.target===this)closeUpgradeModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;width:100%;max-width:720px;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:1.5rem;border-bottom:1px solid var(--border)">
+      <div>
+        <h2 style="font-family:var(--font-display);font-size:1.3rem;font-weight:800;margin-bottom:0.2rem">Upgrade ChisCode</h2>
+        <p style="font-size:0.82rem;color:var(--ghost)">Unlock more generations, higher limits, and priority access.</p>
+      </div>
+      <button onclick="closeUpgradeModal()" style="background:none;border:none;color:var(--ghost);cursor:pointer;font-size:1.5rem;line-height:1;padding:0.2rem">×</button>
+    </div>
+
+    <div style="padding:1.5rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem">
+
+      <!-- Free -->
+      <div class="plan-card" id="plan-free">
+        <div class="plan-card__name" style="color:var(--ghost)">Free</div>
+        <div class="plan-card__price">$0<span>/mo</span></div>
+        <div style="height:1px;background:var(--border);margin:0.75rem 0"></div>
+        <div class="plan-card__feature">5 generations/day</div>
+        <div class="plan-card__feature">GitHub push</div>
+        <div class="plan-card__feature">Community support</div>
+        <button class="btn btn-ghost btn-sm" style="width:100%;justify-content:center;margin-top:1rem" disabled>Current Plan</button>
+      </div>
+
+      <!-- Basic -->
+      <div class="plan-card" id="plan-basic">
+        <div class="plan-card__name" style="color:var(--electric)">Basic</div>
+        <div class="plan-card__price">$9<span>/mo</span></div>
+        <div style="height:1px;background:var(--border);margin:0.75rem 0"></div>
+        <div class="plan-card__feature">100 generations/day</div>
+        <div class="plan-card__feature">GitHub push + PRs</div>
+        <div class="plan-card__feature">Project history</div>
+        <div class="plan-card__feature">Email support</div>
+        <button class="btn btn-sm" style="width:100%;justify-content:center;margin-top:1rem;background:rgba(0,229,255,0.1);border-color:var(--electric);color:var(--electric)" onclick="startUpgrade('basic')">Upgrade to Basic</button>
+      </div>
+
+      <!-- Pro (featured) -->
+      <div class="plan-card featured" id="plan-pro">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.1rem">
+          <div class="plan-card__name" style="color:var(--neon)">Pro</div>
+          <span style="font-size:0.62rem;font-weight:800;text-transform:uppercase;letter-spacing:0.08em;padding:0.2rem 0.5rem;background:var(--neon);color:var(--void);border-radius:4px">Most Popular</span>
+        </div>
+        <div class="plan-card__price">$29<span>/mo</span></div>
+        <div style="height:1px;background:rgba(57,255,20,0.2);margin:0.75rem 0"></div>
+        <div class="plan-card__feature">1000 generations/day</div>
+        <div class="plan-card__feature">All frameworks + MCP</div>
+        <div class="plan-card__feature">Version history</div>
+        <div class="plan-card__feature">Priority generation</div>
+        <div class="plan-card__feature">Slack support</div>
+        <button class="btn btn-sm" style="width:100%;justify-content:center;margin-top:1rem;background:var(--neon);color:var(--void);border-color:var(--neon);font-weight:800" onclick="startUpgrade('pro')">Upgrade to Pro</button>
+      </div>
+
+    </div>
+
+    <div style="padding:0 1.5rem 1.25rem;font-size:0.75rem;color:var(--muted);text-align:center">
+      All plans include a 7-day free trial. Cancel anytime. Payments via Stripe.
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     ITERATE MODAL
+     ═══════════════════════════════════════════ -->
+<div id="iterate-modal" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,0.8);backdrop-filter:blur(8px);align-items:center;justify-content:center;padding:1rem" onclick="if(event.target===this)this.style.display='none'">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;width:100%;max-width:560px;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:1.25rem 1.5rem;border-bottom:1px solid var(--border)">
+      <h3 style="font-family:var(--font-display);font-size:1rem;font-weight:700">Iterate Project</h3>
+      <button onclick="document.getElementById('iterate-modal').style.display='none'" style="background:none;border:none;color:var(--ghost);cursor:pointer;font-size:1.4rem;line-height:1">×</button>
+    </div>
+    <div style="padding:1.5rem;display:flex;flex-direction:column;gap:1rem">
+      <div class="form-group">
+        <label class="form-label">What should I change or improve?</label>
+        <textarea id="iterate-prompt" class="form-input" rows="4" placeholder="E.g. Add a dark mode toggle, fix login validation, add loading spinners…" style="min-height:120px;resize:vertical"></textarea>
+      </div>
+      <div id="iterate-log" style="display:none" class="terminal">
+        <div class="terminal__header">
+          <div class="terminal__dot" style="background:#FF5F57"></div>
+          <div class="terminal__dot" style="background:#FEBC2E"></div>
+          <div class="terminal__dot" style="background:#28C840"></div>
+          <span style="margin-left:0.5rem;font-size:0.72rem;color:var(--ghost)">iteration log</span>
+        </div>
+        <div id="iterate-log-body" class="terminal__body" style="max-height:180px;overflow-y:auto">
+          <span class="terminal__cursor"></span>
+        </div>
+      </div>
+      <div id="iterate-pr-result" style="display:none;background:rgba(0,255,136,0.06);border:1px solid var(--neon);border-radius:8px;padding:1rem">
+        <div style="font-size:0.85rem;font-weight:700;color:var(--neon);margin-bottom:0.5rem">✅ Pull Request opened</div>
+        <a id="iterate-pr-link" href="#" target="_blank" class="btn btn-primary btn-sm">View PR on GitHub →</a>
+      </div>
+      <div id="iterate-error" style="display:none;color:var(--plasma);font-size:0.8rem;padding:0.6rem;background:rgba(255,61,107,0.08);border-radius:6px;border:1px solid rgba(255,61,107,0.2)"></div>
+      <button id="iterate-btn" class="btn btn-primary" style="justify-content:center" onclick="submitIterate()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:0.3rem"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        Run Iteration
+      </button>
+    </div>
+  </div>
+</div>
+
+<style>
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const API       = '/api/v1';
+const projectId = window.location.pathname.split('/').filter(Boolean).pop();
+let fileTree    = {};
+let openTabs    = [];
+let activeTab   = null;
+let projectData = null;
+
+const STATUS_COLOR = {
+  complete:'neon', failed:'plasma', generating:'electric', pending:'ghost',
+  awaiting_confirmation:'amber', awaiting_stack_selection:'electric',
+  stack_selected:'electric', quality_check:'electric',
+  analyzing:'electric', committing:'amber', cancelled:'ghost',
+};
+
+// ── Helpers ──────────────────────────────────────────────────
+function fileIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  const m = { py:'🐍',js:'⚡',ts:'⚡',jsx:'⚛',tsx:'⚛',html:'🌐',css:'🎨',
+              json:'📋',md:'📝',txt:'📄',sh:'⚙️',yaml:'⚙️',yml:'⚙️',
+              toml:'⚙️',env:'🔑',sql:'🗄️',db:'🗄️',png:'🖼️',jpg:'🖼️',
+              svg:'🖼️',rs:'🦀',go:'🐹',rb:'💎',lock:'🔒' };
+  if (name.toLowerCase()==='dockerfile') return '🐋';
+  if (name.startsWith('.')) return '🔧';
+  return m[ext] || '📄';
+}
+
+function detectLang(f) {
+  const e = f.split('.').pop().toLowerCase();
+  const m = { py:'python',js:'javascript',ts:'typescript',jsx:'javascript',tsx:'typescript',
+              html:'html',css:'css',json:'json',md:'markdown',sh:'bash',bash:'bash',
+              yaml:'yaml',yml:'yaml',toml:'toml',sql:'sql',rs:'rust',go:'go',
+              rb:'ruby',php:'php',java:'java',cpp:'cpp',c:'c' };
+  return m[e] || 'plaintext';
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function apiFetch(path, opts={}) {
+  const res = await fetch(API+path, { credentials:'include', ...opts });
+  if (res.status===401) { window.location.href='/login'; return null; }
+  return res;
+}
+
+// ── Load project ─────────────────────────────────────────────
+async function loadProject() {
+  const res = await apiFetch('/projects/'+projectId);
+  if (!res) return;
+  if (!res.ok) { window.location.href='/dashboard'; return; }
+  const p = await res.json();
+  projectData = p;
+  fileTree = p.file_tree || {};
+
+  document.getElementById('proj-name').textContent = p.name;
+  document.getElementById('proj-meta').textContent =
+    (p.description || p.original_prompt || '').slice(0,72) + '…';
+
+  // Status badge
+  const badge = document.getElementById('proj-status-badge');
+  badge.textContent = p.status.replace(/_/g,' ');
+  badge.className = 'status-pill badge-'+(STATUS_COLOR[p.status]||'ghost');
+
+  // Info panel
+  const stack = p.stack
+    ? [p.stack.frontend,p.stack.backend,p.stack.database].filter(Boolean).join(' · ')
+    : '—';
+  document.getElementById('info-files').textContent   = Object.keys(fileTree).length;
+  document.getElementById('info-version').textContent = 'v'+p.current_version;
+  document.getElementById('info-stack').textContent   = stack||'—';
+  document.getElementById('info-date').textContent    = new Date(p.created_at).toLocaleDateString();
+  document.getElementById('proj-info').style.display  = 'grid';
+
+  // Deploy + Preview — show immediately when complete
+  if (p.status === 'complete') {
+    const row = document.getElementById('deploy-preview-row');
+    row.style.display = 'flex';
+    document.getElementById('deploy-btn').href  = `/projects/${projectId}/deploy`;
+    document.getElementById('preview-btn').href = `/projects/${projectId}/deploy?tab=preview`;
+  }
+
+  if (p.github_repo_url) {
+    document.getElementById('github-link').href = p.github_repo_url;
+    document.getElementById('github-link-row').style.display = 'block';
+  }
+
+  // Plan badge (clickable → upgrade)
+  const planRes = await apiFetch('/users/me');
+  if (planRes?.ok) {
+    const u = await planRes.json();
+    const pb = document.getElementById('plan-badge');
+    pb.textContent = u.plan.toUpperCase();
+    pb.className = 'badge cursor-pointer badge-'+(u.plan==='pro'||u.plan==='yearly'?'neon':u.plan==='basic'?'electric':'ghost');
+    // Mark current plan in upgrade modal
+    ['free','basic','pro'].forEach(plan => {
+      const card = document.getElementById('plan-'+plan);
+      if (card) {
+        if (u.plan===plan) {
+          card.querySelector('button').textContent = 'Current Plan';
+          card.querySelector('button').disabled = true;
+        }
+      }
+    });
+  }
+
+  renderFileTree(fileTree);
+  const files = Object.keys(fileTree);
+  if (files.length) openFile(files[0]);
+}
+
+// ── File tree ─────────────────────────────────────────────────
+function renderFileTree(tree) {
+  const files = Object.keys(tree).sort();
+  const dirs  = {};
+  files.forEach(f => {
+    const parts = f.split('/');
+    const dir   = parts.length > 1 ? parts.slice(0,-1).join('/') : '';
+    (dirs[dir] = dirs[dir]||[]).push(f);
+  });
+
+  let html = '';
+  Object.keys(dirs).sort().forEach(dir => {
+    if (dir) html += `<div class="filetree__dir">${escHtml(dir)}/</div>`;
+    dirs[dir].forEach(f => {
+      const name = f.split('/').pop();
+      html += `
+        <div class="filetree__file" id="ft-${CSS.escape(f)}" onclick="openFile(${JSON.stringify(f)})">
+          <span class="filetree__file-icon">${fileIcon(name)}</span>
+          <span style="overflow:hidden;text-overflow:ellipsis">${escHtml(name)}</span>
+        </div>`;
+    });
+  });
+
+  document.getElementById('file-list').innerHTML = html ||
+    '<div style="padding:1rem 1.25rem;color:var(--muted);font-size:0.8rem">No files generated yet.</div>';
+}
+
+// ── Tabs + Code viewer ────────────────────────────────────────
+function openFile(filepath) {
+  if (fileTree[filepath] === undefined) return;
+  if (!openTabs.find(t=>t.path===filepath))
+    openTabs.push({ path:filepath, label:filepath.split('/').pop() });
+  setActiveTab(filepath);
+}
+
+function setActiveTab(filepath) {
+  activeTab = filepath;
+  renderTabs();
+  renderCode(filepath);
+  document.querySelectorAll('.filetree__file').forEach(el=>el.classList.remove('filetree__file--active'));
+  const el = document.getElementById('ft-'+CSS.escape(filepath));
+  if (el) { el.classList.add('filetree__file--active'); el.scrollIntoView({block:'nearest'}); }
+}
+
+function closeTab(filepath, e) {
+  e.stopPropagation();
+  openTabs = openTabs.filter(t=>t.path!==filepath);
+  if (activeTab===filepath) {
+    activeTab = openTabs.length ? openTabs[openTabs.length-1].path : null;
+    activeTab ? renderCode(activeTab) : showEmpty();
+  }
+  renderTabs();
+}
+
+function renderTabs() {
+  document.getElementById('tabs-bar').innerHTML = openTabs.map(t=>`
+    <div class="codeview__tab ${t.path===activeTab?'codeview__tab--active':''}"
+         onclick="setActiveTab(${JSON.stringify(t.path)})">
+      <span>${fileIcon(t.label)}</span>
+      <span>${escHtml(t.label)}</span>
+      <span class="codeview__tab-close" onclick="closeTab(${JSON.stringify(t.path)},event)">×</span>
+    </div>`).join('');
+}
+
+function renderCode(filepath) {
+  const content = fileTree[filepath]||'';
+  document.getElementById('toolbar').style.display = 'flex';
+  document.getElementById('current-filepath').textContent = filepath;
+  const lines   = content.split('\n');
+  const lineNums = lines.map((_,i)=>i+1).join('\n');
+  document.getElementById('code-body').innerHTML = `
+    <div class="line-numbers-wrapper">
+      <div class="line-numbers">${escHtml(lineNums)}</div>
+      <div class="line-numbers-code">
+        <pre><code class="language-${detectLang(filepath)}">${escHtml(content)}</code></pre>
+      </div>
+    </div>`;
+  setTimeout(()=>{
+    if (window.hljs)
+      document.getElementById('code-body').querySelectorAll('pre code').forEach(el=>hljs.highlightElement(el));
+  }, 50);
+}
+
+function showEmpty() {
+  document.getElementById('toolbar').style.display='none';
+  document.getElementById('code-body').innerHTML=`
+    <div class="codeview__empty">
+      <div class="codeview__empty-icon">📂</div>
+      <p style="font-size:0.9rem;color:var(--ghost)">Select a file from the tree</p>
+    </div>`;
+}
+
+// ── Copy ──────────────────────────────────────────────────────
+function copyCurrentFile() {
+  if (!activeTab) return;
+  navigator.clipboard.writeText(fileTree[activeTab]||'').then(()=>{
+    const btn = document.getElementById('copy-btn');
+    if (btn) { btn.classList.add('copy-flash'); setTimeout(()=>btn.classList.remove('copy-flash'),700); }
+    if (window.showToast) showToast('Copied!','success');
+  });
+}
+
+// ── Download single file ──────────────────────────────────────
+function downloadFile() {
+  if (!activeTab) return;
+  const blob = new Blob([fileTree[activeTab]||''],{type:'text/plain'});
+  const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:activeTab.split('/').pop()});
+  a.click(); URL.revokeObjectURL(a.href);
+}
+
+// ── Export ZIP ────────────────────────────────────────────────
+async function exportZip() {
+  const files = Object.keys(fileTree);
+  if (!files.length) { if (window.showToast) showToast('No files to export','error'); return; }
+
+  const btn      = document.getElementById('export-btn');
+  const progress = document.getElementById('export-progress');
+  const progText = document.getElementById('export-progress-text');
+  btn.disabled   = true;
+  progress.classList.add('show');
+  progText.textContent = 'Building zip…';
+
+  try {
+    // Wait for JSZip to be available (loaded via defer)
+    let attempts = 0;
+    while (!window.JSZip && attempts++ < 20) await new Promise(r=>setTimeout(r,100));
+    if (!window.JSZip) throw new Error('JSZip library not loaded');
+
+    const zip  = new JSZip();
+    const name = (projectData?.name || 'chiscode-project').replace(/[^a-zA-Z0-9_-]/g,'-');
+    const root = zip.folder(name);
+
+    let done = 0;
+    for (const [filepath, content] of Object.entries(fileTree)) {
+      root.file(filepath, content);
+      done++;
+      progText.textContent = `Packing ${done}/${files.length}…`;
+      await new Promise(r=>setTimeout(r,0)); // yield to UI
+    }
+
+    progText.textContent = 'Compressing…';
+    const blob = await zip.generateAsync({ type:'blob', compression:'DEFLATE', compressionOptions:{level:6} });
+    const a = Object.assign(document.createElement('a'),{
+      href: URL.createObjectURL(blob),
+      download: `${name}.zip`,
+    });
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    progText.textContent = `✅ ${files.length} files exported`;
+    setTimeout(()=>{ progress.classList.remove('show'); progText.textContent='Building zip…'; }, 2500);
+
+  } catch(err) {
+    progText.textContent = '❌ Export failed';
+    setTimeout(()=>{ progress.classList.remove('show'); }, 2500);
+    console.error('Export error:', err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Delete ────────────────────────────────────────────────────
+function toggleDeleteConfirm() {
+  document.getElementById('delete-confirm').classList.toggle('show');
+}
+
+async function deleteProject() {
+  const res = await apiFetch('/projects/'+projectId, { method:'DELETE' });
+  if (res && (res.ok || res.status===204)) {
+    window.location.href = '/dashboard';
+  } else {
+    const err = res ? await res.json().catch(()=>({})) : {};
+    if (window.showToast) showToast(err.detail||'Delete failed','error');
+    toggleDeleteConfirm();
+  }
+}
+
+// ── Upgrade modal ─────────────────────────────────────────────
+function openUpgradeModal()  { document.getElementById('upgrade-modal').style.display='flex'; }
+function closeUpgradeModal() { document.getElementById('upgrade-modal').style.display='none'; }
+
+function startUpgrade(plan) {
+  // TODO: wire to RevenueCat / Stripe when billing is set up
+  // For now redirect to a placeholder or show coming-soon
+  if (window.showToast) showToast(`${plan} plan — billing coming soon!`, 'info');
+}
+
+// ── Iterate ──────────────────────────────────────────────────
+function openIterateModal() {
+  document.getElementById('iterate-pr-result').style.display='none';
+  document.getElementById('iterate-error').style.display='none';
+  document.getElementById('iterate-modal').style.display='flex';
+}
+
+async function submitIterate() {
+  const prompt  = document.getElementById('iterate-prompt').value.trim();
+  if (!prompt) return;
+
+  const btn     = document.getElementById('iterate-btn');
+  const logEl   = document.getElementById('iterate-log');
+  const logBody = document.getElementById('iterate-log-body');
+  const errEl   = document.getElementById('iterate-error');
+  btn.disabled  = true;
+  btn.textContent = 'Running…';
+  logEl.style.display = 'block';
+  errEl.style.display = 'none';
+
+  function addLog(msg, cls='') {
+    const line = document.createElement('div');
+    line.className = 'terminal__line'+(cls?' terminal__line--'+cls:'');
+    line.textContent = msg;
+    logBody.insertBefore(line, logBody.lastChild);
+    logBody.scrollTop = logBody.scrollHeight;
+  }
+
+  addLog('Starting iteration…');
+
+  const res = await apiFetch('/projects/'+projectId+'/iterate', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({prompt}),
+  });
+
+  if (!res || !res.ok) {
+    const err = res ? await res.json().catch(()=>({})) : {};
+    errEl.textContent = err.detail||'Iterate failed — ensure project is complete and GitHub is connected.';
+    errEl.style.display='block';
+    btn.disabled=false; btn.textContent='Run Iteration'; return;
+  }
+
+  // Stream SSE
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = '';
+
+  while (true) {
+    const {done,value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value,{stream:true});
+    const lines = buffer.split('\n'); buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const msg = JSON.parse(line.slice(6));
+        if (msg.event==='log')    addLog(msg.message);
+        if (msg.event==='status') addLog('→ '+msg.message);
+        if (msg.event==='file')   addLog('✅ '+msg.filename,'complete');
+        if (msg.event==='issues') msg.issues?.forEach(i=>addLog('⚠ '+i));
+        if (msg.event==='github_done') {
+          addLog('🎉 PR opened!','complete');
+          const prPanel = document.getElementById('iterate-pr-result');
+          document.getElementById('iterate-pr-link').href = msg.pr_url||'#';
+          prPanel.style.display='block';
+          // Refresh file tree with updated files
+          await loadProject();
+        }
+        if (msg.event==='error') {
+          addLog('❌ '+msg.message,'error');
+          errEl.textContent=msg.message; errEl.style.display='block';
+        }
+      } catch {}
+    }
+  }
+
+  btn.disabled=false; btn.textContent='Run Iteration';
+}
+
+// ── Keyboard shortcuts ───────────────────────────────────────
+document.addEventListener('keydown', e=>{
+  if ((e.ctrlKey||e.metaKey) && e.key==='c'
+      && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) {
+    copyCurrentFile();
+  }
+  if (e.key==='Escape') {
+    ['upgrade-modal','iterate-modal'].forEach(id=>{
+      document.getElementById(id).style.display='none';
+    });
+    document.getElementById('delete-confirm').classList.remove('show');
+  }
+});
+
+// ── Boot ─────────────────────────────────────────────────────
+loadProject();
+</script>
+{% endblock %}
