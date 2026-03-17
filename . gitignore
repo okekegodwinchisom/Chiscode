@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Docker
+*.override.yml
+
+# Node (frontend tooling)
+node_modules/
+.npm
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Temp
+temp/
+tmp/
+*.tmp
+logs/
