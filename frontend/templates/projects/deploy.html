@@ -1,0 +1,418 @@
+{% extends "base.html" %}
+{% block title %}Deploy — ChisCode{% endblock %}
+
+{% block head %}
+<style>
+  .deploy-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+  @media (max-width: 640px) { .deploy-grid { grid-template-columns: 1fr; } }
+
+  .platform-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    background: var(--surface);
+    cursor: pointer;
+    transition: all 0.15s;
+    position: relative;
+  }
+  .platform-card:hover  { border-color: var(--electric); background: rgba(0,229,255,0.04); }
+  .platform-card.active { border-color: var(--electric); background: rgba(0,229,255,0.08); }
+  .platform-card.config-only { border-color: var(--amber); }
+
+  .platform-logo { font-size: 1.8rem; margin-bottom: 0.5rem; }
+  .platform-name { font-family: var(--font-display); font-weight: 700; font-size: 0.95rem; margin-bottom: 0.2rem; }
+  .platform-desc { font-size: 0.75rem; color: var(--ghost); line-height: 1.45; }
+  .platform-badge {
+    position: absolute; top: 0.75rem; right: 0.75rem;
+    font-size: 0.6rem; font-weight: 800; text-transform: uppercase;
+    letter-spacing: 0.08em; padding: 0.15rem 0.45rem; border-radius: 4px;
+  }
+
+  .token-field { display: none; margin-top: 1rem; }
+  .token-field.show { display: block; }
+
+  .deploy-log {
+    background: var(--void); border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--font-code); font-size: 0.78rem; padding: 0.75rem 1rem;
+    max-height: 240px; overflow-y: auto; display: none;
+  }
+  .deploy-log.show { display: block; }
+  .log-line { padding: 0.15rem 0; color: var(--ghost); }
+  .log-line.success { color: var(--neon); }
+  .log-line.error   { color: var(--plasma); }
+  .log-line.info    { color: var(--electric); }
+
+  .preview-frame {
+    width: 100%; border: 1px solid var(--border); border-radius: 8px;
+    background: white; display: none;
+  }
+  .preview-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.25rem;
+  }
+  .lang-bar { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; display: flex; margin: 0.5rem 0; }
+  .lang-bar-seg { height: 100%; transition: width 0.3s ease; }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 0.75rem; margin: 0.75rem 0; }
+  .stat-box { background: var(--raised); border-radius: 8px; padding: 0.75rem; text-align: center; }
+  .stat-box__num { font-family: var(--font-display); font-size: 1.4rem; font-weight: 800; color: var(--white); }
+  .stat-box__label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-top: 0.2rem; }
+</style>
+{% endblock %}
+
+{% block body %}
+<nav class="nav">
+  <a href="/projects/{{ project_id }}" style="display:flex;align-items:center;gap:.4rem;color:var(--ghost);font-size:.8rem;text-decoration:none;margin-right:1rem">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+    Back to Project
+  </a>
+  <a href="/" class="nav__logo">Chis<span>Code</span></a>
+  <div class="nav__links">
+    <span id="proj-name-badge" class="badge badge-ghost">{{ project_name }}</span>
+  </div>
+</nav>
+
+<div style="max-width:1040px;margin:0 auto;padding:1.5rem 1rem 3rem">
+
+  <h1 style="font-family:var(--font-display);font-size:1.4rem;font-weight:800;margin-bottom:0.25rem">Deploy Your App</h1>
+  <p style="color:var(--ghost);font-size:0.85rem;margin-bottom:1.5rem">Push to a live URL with one click, or download the full source.</p>
+
+  <!-- ── Preview panel ── -->
+  <div style="margin-bottom:2rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem">
+      <h2 style="font-family:var(--font-display);font-size:1rem;font-weight:700">Project Preview</h2>
+      <button class="btn btn-ghost btn-sm" onclick="refreshPreview()" id="preview-btn">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:.3rem"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Generate Preview
+      </button>
+    </div>
+
+    <div id="preview-container" style="display:none">
+      <!-- Live iframe preview -->
+      <iframe id="preview-iframe" class="preview-frame" height="420" title="Live Preview" sandbox="allow-scripts allow-same-origin"></iframe>
+      <!-- Card preview for non-HTML projects -->
+      <div id="preview-card" class="preview-card" style="display:none">
+        <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem">
+          <div style="font-size:2rem" id="card-icon">🚀</div>
+          <div>
+            <div style="font-family:var(--font-display);font-size:1rem;font-weight:700" id="card-name"></div>
+            <div style="font-size:.75rem;color:var(--ghost)" id="card-stack"></div>
+          </div>
+        </div>
+        <div class="stat-grid" id="card-stats"></div>
+        <div style="font-size:.75rem;color:var(--ghost);margin:.5rem 0 .25rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Languages</div>
+        <div class="lang-bar" id="lang-bar"></div>
+        <div id="lang-labels" style="display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.35rem"></div>
+        <div id="features-row" style="margin-top:.75rem;display:flex;flex-wrap:wrap;gap:.4rem"></div>
+      </div>
+    </div>
+
+    <div id="preview-placeholder" style="border:1px dashed var(--border);border-radius:8px;padding:2rem;text-align:center;color:var(--muted)">
+      <div style="font-size:1.5rem;margin-bottom:.5rem">👁</div>
+      <p style="font-size:.82rem">Click "Generate Preview" to see your project</p>
+    </div>
+  </div>
+
+  <!-- ── Platform selection ── -->
+  <h2 style="font-family:var(--font-display);font-size:1rem;font-weight:700;margin-bottom:.75rem">Choose a Platform</h2>
+
+  <div class="deploy-grid">
+    <!-- Vercel -->
+    <div class="platform-card" id="card-vercel" onclick="selectPlatform('vercel')">
+      <span class="platform-badge" style="background:#fff;color:#000">Live</span>
+      <div class="platform-logo">▲</div>
+      <div class="platform-name">Vercel</div>
+      <div class="platform-desc">Instant deploys for frontend & full-stack apps. Best for Next.js, React, Vue.</div>
+    </div>
+    <!-- Netlify -->
+    <div class="platform-card" id="card-netlify" onclick="selectPlatform('netlify')">
+      <span class="platform-badge" style="background:#00C7B7;color:#fff">Live</span>
+      <div class="platform-logo">◆</div>
+      <div class="platform-name">Netlify</div>
+      <div class="platform-desc">JAMstack hosting with serverless functions. Great for static sites & SPAs.</div>
+    </div>
+    <!-- Render -->
+    <div class="platform-card config-only" id="card-render" onclick="selectPlatform('render')">
+      <span class="platform-badge" style="background:var(--amber);color:var(--void)">Config</span>
+      <div class="platform-logo">🖥</div>
+      <div class="platform-name">Render</div>
+      <div class="platform-desc">Generates render.yaml. Connect your GitHub repo at dashboard.render.com.</div>
+    </div>
+    <!-- Fly.io -->
+    <div class="platform-card config-only" id="card-fly" onclick="selectPlatform('fly')">
+      <span class="platform-badge" style="background:var(--violet);color:#fff">Config</span>
+      <div class="platform-logo">✈</div>
+      <div class="platform-name">Fly.io</div>
+      <div class="platform-desc">Generates fly.toml + Dockerfile. Run `flyctl deploy` locally.</div>
+    </div>
+    <!-- Cloudflare -->
+    <div class="platform-card" id="card-cloudflare" onclick="selectPlatform('cloudflare')">
+      <span class="platform-badge" style="background:#F6821F;color:#fff">Live</span>
+      <div class="platform-logo">☁</div>
+      <div class="platform-name">Cloudflare Pages</div>
+      <div class="platform-desc">Global edge deployment. Perfect for static sites and Workers apps.</div>
+    </div>
+    <!-- Download -->
+    <div class="platform-card" id="card-download" onclick="selectPlatform('download')">
+      <span class="platform-badge" style="background:var(--ghost);color:var(--void)">Local</span>
+      <div class="platform-logo">⬇</div>
+      <div class="platform-name">Download .zip</div>
+      <div class="platform-desc">Export all files as a zip archive for local development or manual deploy.</div>
+    </div>
+  </div>
+
+  <!-- ── Token inputs (shown per platform) ── -->
+  <div id="token-vercel"     class="token-field">
+    <label class="form-label">Vercel API Token</label>
+    <input id="vercel-token" class="form-input" type="password" placeholder="Paste your Vercel token from vercel.com/account/tokens">
+    <p style="font-size:.72rem;color:var(--ghost);margin-top:.35rem">Get yours at <a href="https://vercel.com/account/tokens" target="_blank" style="color:var(--electric)">vercel.com/account/tokens</a></p>
+  </div>
+  <div id="token-netlify" class="token-field">
+    <label class="form-label">Netlify Personal Access Token</label>
+    <input id="netlify-token" class="form-input" type="password" placeholder="Paste your Netlify token">
+    <p style="font-size:.72rem;color:var(--ghost);margin-top:.35rem">Get yours at <a href="https://app.netlify.com/user/applications" target="_blank" style="color:var(--electric)">app.netlify.com/user/applications</a></p>
+  </div>
+  <div id="token-cloudflare" class="token-field">
+    <label class="form-label">Cloudflare API Token</label>
+    <input id="cf-token" class="form-input" type="password" placeholder="Cloudflare API Token" style="margin-bottom:.5rem">
+    <label class="form-label" style="margin-top:.5rem">Account ID</label>
+    <input id="cf-account" class="form-input" type="text" placeholder="Cloudflare Account ID">
+    <p style="font-size:.72rem;color:var(--ghost);margin-top:.35rem">Find both at <a href="https://dash.cloudflare.com" target="_blank" style="color:var(--electric)">dash.cloudflare.com</a></p>
+  </div>
+
+  <!-- ── Deploy button + log ── -->
+  <div id="deploy-action" style="display:none;margin-top:1.5rem">
+    <button id="deploy-btn" class="btn btn-primary" style="justify-content:center;min-width:180px" onclick="startDeploy()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:.35rem"><path d="M22 2L11 13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      <span id="deploy-btn-label">Deploy Now</span>
+    </button>
+    <div class="deploy-log" id="deploy-log"></div>
+    <div id="deploy-result" style="display:none;margin-top:1rem;padding:1rem;border:1px solid var(--neon);border-radius:8px;background:rgba(57,255,20,0.06)">
+      <div style="font-weight:700;color:var(--neon);margin-bottom:.4rem">🎉 Deployed!</div>
+      <a id="deploy-url" href="#" target="_blank" class="btn btn-primary btn-sm">Open Live App →</a>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const API       = '/api/v1';
+const projectId = '{{ project_id }}';
+let selectedPlatform = null;
+
+const LANG_COLORS = {
+  'Python':'#3776AB','JavaScript':'#F7DF1E','TypeScript':'#3178C6',
+  'React':'#61DAFB','React/TypeScript':'#3178C6','HTML':'#E34F26',
+  'CSS':'#1572B6','JSON':'#6b7f95','Markdown':'#555','Go':'#00ADD8',
+  'Rust':'#CE4A00',
+};
+
+async function apiFetch(path, opts={}) {
+  const res = await fetch(API+path, {credentials:'include',...opts});
+  if (res.status===401) { window.location.href='/login'; return null; }
+  return res;
+}
+
+// ── Platform selection ────────────────────────────────────────
+function selectPlatform(p) {
+  selectedPlatform = p;
+
+  document.querySelectorAll('.platform-card').forEach(c=>c.classList.remove('active'));
+  document.getElementById('card-'+p)?.classList.add('active');
+
+  // Hide all token fields
+  ['vercel','netlify','cloudflare'].forEach(k=>
+    document.getElementById('token-'+k).classList.remove('show'));
+
+  if (['vercel','netlify','cloudflare'].includes(p))
+    document.getElementById('token-'+p).classList.add('show');
+
+  const actionEl = document.getElementById('deploy-action');
+  actionEl.style.display = 'block';
+
+  const labelMap = {
+    vercel:'Deploy to Vercel', netlify:'Deploy to Netlify',
+    render:'Generate render.yaml', fly:'Generate fly.toml',
+    cloudflare:'Deploy to Cloudflare', download:'Download .zip',
+  };
+  document.getElementById('deploy-btn-label').textContent = labelMap[p] || 'Deploy';
+
+  // Reset result
+  document.getElementById('deploy-result').style.display = 'none';
+  document.getElementById('deploy-log').classList.remove('show');
+  document.getElementById('deploy-log').innerHTML = '';
+}
+
+// ── Deploy ────────────────────────────────────────────────────
+async function startDeploy() {
+  if (!selectedPlatform) return;
+
+  if (selectedPlatform === 'download') {
+    // Trigger JSZip download (reuse logic from detail page)
+    window.dispatchEvent(new CustomEvent('chiscode:export'));
+    return;
+  }
+
+  const btn    = document.getElementById('deploy-btn');
+  const logEl  = document.getElementById('deploy-log');
+  btn.disabled = true;
+  btn.querySelector('#deploy-btn-label').textContent = 'Deploying…';
+  logEl.classList.add('show');
+  logEl.innerHTML = '';
+
+  function addLog(msg, cls='') {
+    const line = document.createElement('div');
+    line.className = 'log-line'+(cls?' '+cls:'');
+    line.textContent = msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  const body = {
+    platform: selectedPlatform,
+    vercel_token:  document.getElementById('vercel-token')?.value  || null,
+    netlify_token: document.getElementById('netlify-token')?.value || null,
+    cf_api_token:  document.getElementById('cf-token')?.value      || null,
+    cf_account_id: document.getElementById('cf-account')?.value    || null,
+  };
+
+  const res = await apiFetch('/projects/'+projectId+'/deploy', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!res) return;
+
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = '';
+
+  while (true) {
+    const {done,value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream:true});
+    const lines = buffer.split('\n'); buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const ev = JSON.parse(line.slice(6));
+        if (ev.event==='log')          addLog(ev.message);
+        if (ev.event==='status')       addLog('→ '+ev.message, 'info');
+        if (ev.event==='error')        { addLog('❌ '+ev.message, 'error'); break; }
+        if (ev.event==='config_ready') { addLog('✅ Config files added to project', 'success'); }
+        if (ev.event==='deploy_done') {
+          addLog(ev.message, 'success');
+          if (ev.url) {
+            const resultEl = document.getElementById('deploy-result');
+            document.getElementById('deploy-url').href = ev.url;
+            document.getElementById('deploy-url').textContent = 'Open Live App → '+ev.url;
+            resultEl.style.display = 'block';
+          }
+        }
+      } catch {}
+    }
+  }
+
+  btn.disabled = false;
+  btn.querySelector('#deploy-btn-label').textContent =
+    {vercel:'Deploy to Vercel',netlify:'Deploy to Netlify',render:'Generate Config',
+     fly:'Generate Config',cloudflare:'Deploy to Cloudflare'}[selectedPlatform]||'Deploy';
+}
+
+// ── Preview ───────────────────────────────────────────────────
+async function refreshPreview() {
+  const btn = document.getElementById('preview-btn');
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+
+  const res = await apiFetch('/projects/'+projectId+'/preview', {method:'POST'});
+  if (!res?.ok) { btn.disabled=false; btn.textContent='Generate Preview'; return; }
+
+  const info = await res.json();
+
+  document.getElementById('preview-placeholder').style.display = 'none';
+  document.getElementById('preview-container').style.display   = 'block';
+
+  if (info.preview_type === 'live') {
+    const iframe = document.getElementById('preview-iframe');
+    iframe.style.display = 'block';
+    iframe.src = info.iframe_url + '?t=' + Date.now();
+    document.getElementById('preview-card').style.display = 'none';
+  } else {
+    document.getElementById('preview-iframe').style.display = 'none';
+    renderPreviewCard(info.card_data);
+    document.getElementById('preview-card').style.display = 'block';
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Refresh Preview';
+}
+
+function renderPreviewCard(card) {
+  if (!card) return;
+  const icons = {Python:'🐍',JavaScript:'⚡',TypeScript:'⚡',React:'⚛',Go:'🐹',Rust:'🦀'};
+  document.getElementById('card-icon').textContent = icons[card.primary_lang] || '🚀';
+  document.getElementById('card-name').textContent = card.name;
+
+  const stackParts = [card.stack?.frontend, card.stack?.backend, card.stack?.database].filter(Boolean);
+  document.getElementById('card-stack').textContent = stackParts.join(' · ') || card.primary_lang;
+
+  const s = card.stats || {};
+  document.getElementById('card-stats').innerHTML = `
+    <div class="stat-box"><div class="stat-box__num">${s.files||0}</div><div class="stat-box__label">Files</div></div>
+    <div class="stat-box"><div class="stat-box__num">${(s.lines||0).toLocaleString()}</div><div class="stat-box__label">Lines</div></div>
+    <div class="stat-box"><div class="stat-box__num">${s.directories||0}</div><div class="stat-box__label">Dirs</div></div>
+  `;
+
+  const langs = card.languages || [];
+  const total  = langs.reduce((a,l)=>a+l.files,0)||1;
+  const bar    = document.getElementById('lang-bar');
+  const labels = document.getElementById('lang-labels');
+  bar.innerHTML    = '';
+  labels.innerHTML = '';
+  const palette = ['#00e5ff','#39ff14','#ff3d6b','#ffb300','#9d6eff','#00d4aa'];
+  langs.forEach((l,i)=>{
+    const pct   = ((l.files/total)*100).toFixed(1);
+    const color = LANG_COLORS[l.name] || palette[i % palette.length];
+    bar.innerHTML   += `<div class="lang-bar-seg" style="width:${pct}%;background:${color}"></div>`;
+    labels.innerHTML += `<span style="font-size:.7rem;display:flex;align-items:center;gap:.3rem">
+      <span style="width:8px;height:8px;border-radius:50%;background:${color};display:inline-block"></span>
+      ${l.name} <span style="color:var(--muted)">${l.files}</span></span>`;
+  });
+
+  const features = card.features || [];
+  const featRow  = document.getElementById('features-row');
+  featRow.innerHTML = features.map(f=>`<span class="badge badge-ghost" style="font-size:.7rem">${f}</span>`).join('');
+}
+
+// Boot: auto-load preview if available
+(async () => {
+  const res = await apiFetch('/projects/'+projectId+'/preview/card');
+  if (res?.ok) {
+    const card = await res.json();
+    if (card && Object.keys(card).length) {
+      document.getElementById('preview-placeholder').style.display = 'none';
+      document.getElementById('preview-container').style.display   = 'block';
+      // Try live iframe first
+      const iframe = document.getElementById('preview-iframe');
+      iframe.src = API+'/preview/'+projectId;
+      iframe.style.display = 'block';
+      iframe.onerror = () => {
+        iframe.style.display = 'none';
+        renderPreviewCard(card);
+        document.getElementById('preview-card').style.display = 'block';
+      };
+      document.getElementById('preview-btn').textContent = 'Refresh Preview';
+    }
+  }
+})();
+</script>
+{% endblock %}
+        
