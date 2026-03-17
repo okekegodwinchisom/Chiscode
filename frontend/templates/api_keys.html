@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}API Keys — ChisCode{% endblock %}
+
+{% block body %}
+<div class="api-keys-container" style="padding: 2rem;">
+    <h1>API Keys</h1>
+    <div id="api-keys-content">
+        <div class="loading">Loading API key status...</div>
+    </div>
+</div>
+
+<script>
+async function loadApiKeyStatus() {
+    try {
+        const response = await fetch('/api/v1/users/me/api-key/status', {
+            credentials: 'include'
+        });
+        
+        if (response.ok) {
+            const status = await response.json();
+            document.getElementById('api-keys-content').innerHTML = `
+                <p>API Key Status: ${status.has_api_key ? 'Active' : 'Inactive'}</p>
+                <p>Your Plan: ${status.plan}</p>
+                ${status.plan === 'pro' || status.plan === 'yearly' 
+                    ? '<button onclick="generateApiKey()" class="btn btn-primary">Generate New API Key</button>' 
+                    : '<p>Upgrade to Pro for API access</p>'}
+            `;
+        }
+    } catch (error) {
+        console.error('API key error:', error);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', loadApiKeyStatus);
+</script>
+{% endblock %}
