@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}Plans & Pricing — ChisCode{% endblock %}
+
+{% block head %}
+<style>
+  .plans-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+    margin-top: 1.5rem;
+  }
+  .plan-card {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.5rem;
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    transition: border-color 0.15s;
+  }
+  .plan-card.current  { border-color: var(--neon); }
+  .plan-card.featured { border-color: var(--electric); }
+  .plan-card.featured::before {
+    content: "Most Popular";
+    position: absolute; top: -11px; left: 50%; transform: translateX(-50%);
+    background: var(--electric); color: var(--void);
+    font-size: .65rem; font-weight: 800; text-transform: uppercase;
+    letter-spacing: .1em; padding: .2rem .75rem; border-radius: 20px;
+    white-space: nowrap;
+  }
+  .plan-card.current::after {
+    content: "Current Plan";
+    position: absolute; top: -11px; right: 1rem;
+    background: var(--neon); color: var(--void);
+    font-size: .65rem; font-weight: 800; text-transform: uppercase;
+    letter-spacing: .1em; padding: .2rem .65rem; border-radius: 20px;
+  }
+  .plan-name  { font-family: var(--font-display); font-size: 1rem; font-weight: 800; }
+  .plan-price { font-family: var(--font-display); font-size: 1.8rem; font-weight: 900; color: var(--white); margin: .4rem 0; }
+  .plan-price span { font-size: .8rem; color: var(--ghost); font-weight: 400; }
+  .plan-feature {
+    display: flex; align-items: flex-start; gap: .5rem;
+    font-size: .78rem; color: var(--ghost); padding: .25rem 0;
+  }
+  .plan-feature svg { flex-shrink: 0; margin-top: 1px; }
+  .plan-feature.missing { opacity: .35; }
+  .plan-cta { margin-top: auto; padding-top: 1rem; }
+
+  .usage-bar-wrap { background: var(--raised); border-radius: 6px; height: 8px; margin: .5rem 0; overflow: hidden; }
+  .usage-bar      { height: 100%; border-radius: 6px; background: var(--electric); transition: width .5s ease; }
+  .usage-bar.warn { background: var(--amber); }
+  .usage-bar.crit { background: var(--plasma); }
+
+  .billing-section {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem;
+  }
+</style>
+{% endblock %}
+
+{% block body %}
+<nav class="nav">
+  <a href="/dashboard" style="display:flex;align-items:center;gap:.4rem;color:var(--ghost);font-size:.8rem;text-decoration:none;margin-right:1rem">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+    Dashboard
+  </a>
+  <a href="/" class="nav__logo">Chis<span>Code</span></a>
+  <div class="nav__links">
+    <span id="plan-badge" class="badge"></span>
+  </div>
+</nav>
+
+<div style="max-width:900px;margin:0 auto;padding:1.5rem 1rem 3rem">
+
+  <!-- ── Usage card ── -->
+  <div class="billing-section" id="usage-section" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+      <h2 style="font-family:var(--font-display);font-size:.95rem;font-weight:800">Today's Usage</h2>
+      <span id="usage-resets" style="font-size:.72rem;color:var(--ghost)"></span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:.8rem;margin-bottom:.25rem">
+      <span id="usage-label" style="color:var(--ghost)"></span>
+      <span id="usage-count" style="font-family:var(--font-code);color:var(--white)"></span>
+    </div>
+    <div class="usage-bar-wrap">
+      <div class="usage-bar" id="usage-bar" style="width:0%"></div>
+    </div>
+    <div id="billing-alert" style="display:none;margin-top:.75rem;padding:.6rem .85rem;background:rgba(255,61,107,.1);border:1px solid var(--plasma);border-radius:8px;font-size:.78rem;color:var(--plasma)">
+      ⚠ Your account has a billing issue. Please update your payment method via the portal below.
+    </div>
+  </div>
+
+  <!-- ── Active subscription card ── -->
+  <div class="billing-section" id="portal-section" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div style="font-family:var(--font-display);font-size:.95rem;font-weight:800;margin-bottom:.2rem">Manage Subscription</div>
+        <div style="font-size:.77rem;color:var(--ghost)">Cancel, upgrade, or update billing info via the RevenueCat portal.</div>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="openPortal()">
+        Open Portal
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-left:.35rem"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Plans grid ── -->
+  <h1 style="font-family:var(--font-display);font-size:1.4rem;font-weight:800;margin-bottom:.25rem">Plans & Pricing</h1>
+  <p style="color:var(--ghost);font-size:.85rem;margin-bottom:1rem">Upgrade for more generations, API access, and one-click deployments.</p>
+
+  <div class="plans-grid" id="plans-grid">
+    <div style="text-align:center;padding:2rem;color:var(--muted);font-size:.85rem">Loading plans…</div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const API = '/api/v1';
+
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(API + path, { credentials: 'include', ...opts });
+  if (res.status === 401) { window.location.href = '/login'; return null; }
+  return res;
+}
+
+function checkIcon(color = 'var(--neon)') {
+  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2.5"><polyline points="20 6 9 12 4 16"/></svg>`;
+}
+function crossIcon() {
+  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--ghost)" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+}
+
+// ── Load usage ────────────────────────────────────────────────
+async function loadUsage() {
+  const res = await apiFetch('/billing/usage');
+  if (!res?.ok) return;
+  const u = await res.json();
+
+  document.getElementById('usage-section').style.display = 'block';
+  document.getElementById('plan-badge').textContent = u.plan_name;
+  document.getElementById('plan-badge').className = 'badge badge-' +
+    (u.plan === 'free' ? 'ghost' : u.plan === 'yearly' ? 'success' : 'primary');
+
+  const pct   = Math.min(100, Math.round((u.used_today / u.daily_limit) * 100));
+  const bar   = document.getElementById('usage-bar');
+  bar.style.width = pct + '%';
+  bar.className   = 'usage-bar' + (pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '');
+
+  document.getElementById('usage-label').textContent  = `${u.plan_name} Plan`;
+  document.getElementById('usage-count').textContent  = `${u.used_today} / ${u.daily_limit}`;
+  document.getElementById('usage-resets').textContent = `Resets at midnight UTC`;
+}
+
+// ── Load plans grid ───────────────────────────────────────────
+async function loadPlans() {
+  const res = await apiFetch('/billing/plans');
+  if (!res?.ok) return;
+  const { plans, current_plan } = await res.json();
+
+  const grid = document.getElementById('plans-grid');
+  grid.innerHTML = '';
+
+  plans.forEach(plan => {
+    const isFree     = plan.id === 'free';
+    const isCurrent  = plan.is_current;
+    const isFeatured = plan.id === 'pro';
+    const cardClass  = ['plan-card',
+      isCurrent  ? 'current'  : '',
+      isFeatured ? 'featured' : '',
+    ].filter(Boolean).join(' ');
+
+    const featuresHTML = plan.features.map(f =>
+      `<div class="plan-feature">${checkIcon()} <span>${f}</span></div>`
+    ).join('');
+    const missingHTML = plan.missing.map(f =>
+      `<div class="plan-feature missing">${crossIcon()} <span>${f}</span></div>`
+    ).join('');
+
+    let ctaHTML;
+    if (isCurrent) {
+      ctaHTML = `<button class="btn btn-ghost btn-sm plan-cta" style="cursor:default;opacity:.5" disabled>Current Plan</button>`;
+    } else if (isFree) {
+      ctaHTML = `<button class="btn btn-ghost btn-sm plan-cta" disabled>Default</button>`;
+    } else if (plan.is_upgrade && plan.checkout_url) {
+      ctaHTML = `<a href="/api/v1/billing/checkout/${plan.id}" class="btn btn-primary plan-cta" style="justify-content:center">
+        Upgrade to ${plan.name} →</a>`;
+    } else {
+      ctaHTML = `<button class="btn btn-ghost btn-sm plan-cta" onclick="openPortal()">Manage →</button>`;
+    }
+
+    grid.innerHTML += `
+      <div class="${cardClass}">
+        <div class="plan-name" style="color:${isFeatured ? 'var(--electric)' : 'var(--white)'}">${plan.name}</div>
+        <div class="plan-price">${plan.price.split('/')[0]}<span>${plan.price.includes('/') ? '/' + plan.price.split('/')[1] : ''}</span></div>
+        <div style="border-top:1px solid var(--border);margin:.75rem 0 .5rem"></div>
+        ${featuresHTML}${missingHTML}
+        ${ctaHTML}
+      </div>`;
+  });
+}
+
+// ── Load customer portal link ─────────────────────────────────
+async function loadCustomer() {
+  const res = await apiFetch('/billing/customer');
+  if (!res?.ok) return;
+  const info = await res.json();
+
+  if (info.billing_flagged) {
+    document.getElementById('billing-alert').style.display = 'block';
+  }
+  if (info.management_url && info.plan !== 'free') {
+    document.getElementById('portal-section').style.display = 'block';
+  }
+}
+
+async function openPortal() {
+  const res = await apiFetch('/billing/portal', { method: 'POST' });
+  if (!res?.ok) return;
+  const { url } = await res.json();
+  if (url) window.open(url, '_blank');
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+Promise.all([loadUsage(), loadPlans(), loadCustomer()]);
+</script>
+{% endblock %}
