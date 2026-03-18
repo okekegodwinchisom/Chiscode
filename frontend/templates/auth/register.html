@@ -1,0 +1,397 @@
+{% extends "base.html" %}
+{% block title %}Create Account — ChisCode{% endblock %}
+
+{% block head %}
+</style>
+<div id="popupMessage" class="popup-message"></div>
+<style>
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5rem 1.5rem 3rem;
+  background: var(--void);
+}
+
+.auth-box { width: 100%; max-width: 420px; }
+.auth-box__logo {
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+  font-weight: 800;
+  letter-spacing: -.04em;
+  color: var(--white);
+  text-decoration: none;
+  display: block;
+  margin-bottom: 2rem;
+}
+.auth-box__logo em { color: var(--electric); font-style: normal; }
+.auth-box__title { font-family: var(--font-display); font-size: 1.6rem; font-weight: 800; margin-bottom: .25rem; letter-spacing: -.03em; }
+.auth-box__sub   { color: var(--ghost); font-size: .82rem; margin-bottom: 2rem; }
+
+.github-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .6rem;
+  width: 100%;
+  padding: .72rem 1rem;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--white);
+  font-family: var(--font-ui);
+  font-size: .72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  text-decoration: none;
+  transition: all .15s ease;
+}
+.github-btn:hover {
+  background: var(--overlay);
+  border-color: var(--border-bright);
+  color: var(--white);
+  box-shadow: 0 4px 16px rgba(0,0,0,.4);
+}
+
+.auth-form { display: flex; flex-direction: column; gap: 1.1rem; }
+
+/* Password strength */
+.strength-bars {
+  display: flex; gap: 4px;
+  margin-top: .4rem;
+}
+.strength-bar {
+  flex: 1; height: 3px;
+  border-radius: 99px;
+  background: var(--border);
+  transition: background .25s ease;
+}
+.strength-1 .strength-bar:nth-child(-n+1) { background: var(--plasma); }
+.strength-2 .strength-bar:nth-child(-n+2) { background: var(--amber); }
+.strength-3 .strength-bar:nth-child(-n+3) { background: var(--electric); }
+.strength-4 .strength-bar:nth-child(-n+4) { background: var(--neon); }
+
+.strength-label {
+  font-size: .68rem;
+  margin-top: .3rem;
+  transition: color .2s ease;
+  height: 1em;
+}
+.strength-1 .strength-label { color: var(--plasma); }
+.strength-2 .strength-label { color: var(--amber); }
+.strength-3 .strength-label { color: var(--electric); }
+.strength-4 .strength-label { color: var(--neon); }
+
+/* Message styling */
+.register-message {
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+}
+.register-message.error {
+  background: rgba(255, 70, 70, 0.1);
+  border: 1px solid var(--plasma);
+  color: var(--plasma);
+}
+.register-message.success {
+  background: rgba(0, 255, 0, 0.1);
+  border: 1px solid var(--neon);
+  color: var(--neon);
+}
+
+/* Spinner animation */
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-radius: 50%;
+  border-top-color: white;
+  animation: spin 0.8s linear infinite;
+  margin-right: 8px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+</style>
+{% endblock %}
+
+{% block body %}
+
+<!-- Minimal nav -->
+<nav class="nav">
+  <a href="/" class="nav__logo">Chis<em>Code</em></a>
+  <span class="nav__spacer"></span>
+  <div class="nav__links">
+    <a href="/login" class="nav__link">Sign In</a>
+  </div>
+</nav>
+
+<div class="auth-page">
+  <div class="auth-box"
+    x-data="{
+      password: '',
+      get strength() {
+        let s = 0;
+        if (this.password.length >= 8)           s++;
+        if (/[A-Z]/.test(this.password))          s++;
+        if (/[0-9]/.test(this.password))          s++;
+        if (/[^A-Za-z0-9]/.test(this.password))  s++;
+        return s;
+      },
+      get strengthLabel() {
+        return ['', 'Weak', 'Fair', 'Good', 'Strong'][this.strength];
+      },
+      loading: false,
+    }"
+  >
+    <a href="/" class="auth-box__logo">Chis<em>Code</em></a>
+    <h1 class="auth-box__title">Start building</h1>
+    <p class="auth-box__sub">Create your free account. No credit card required.</p>
+
+    <!-- GitHub OAuth -->
+    <!-- Replace your existing GitHub button with this -->
+<button onclick="openGitHubSignup()" class="github-btn">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/>
+  </svg>
+  Continue with GitHub
+</button>
+
+<script>
+function openGitHubSignup() {
+  // Open GitHub login in a new window
+  const width = 600;
+  const height = 700;
+  const left = (window.screen.width / 2) - (width / 2);
+  const top = (window.screen.height / 2) - (height / 2);
+  
+  const popup = window.open(
+    '/api/v1/auth/github',
+    'github-signup',
+    `width=${width},height=${height},top=${top},left=${left},toolbar=no,menubar=no,location=no,status=no`
+  );
+
+  // Listen for message from the popup when login completes
+  window.addEventListener('message', function(event) {
+    if (event.data.type === 'github-login-success') {
+      popup.close();
+      window.location.href = '/dashboard';
+    }
+  });
+}
+</script>
+
+    <div class="divider divider--label" data-label="or" style="margin:1.4rem 0"></div>
+
+    <!-- Registration Form - Using Fetch API -->
+    <form id="registerForm" class="auth-form">
+      <div class="form-group">
+        <label class="form-label" for="username">Username</label>
+        <input
+          id="username" name="username" type="text"
+          class="form-input"
+          placeholder="yourhandle"
+          pattern="[a-zA-Z0-9_\-]{3,50}"
+          title="3–50 characters, letters, numbers, _ or -"
+          required autocomplete="username"
+        />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="email">Email address</label>
+        <input
+          id="email" name="email" type="email"
+          class="form-input"
+          placeholder="you@example.com"
+          required autocomplete="email"
+        />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="password">Password</label>
+        <input
+          id="password" name="password" type="password"
+          class="form-input"
+          placeholder="Min 8 chars · 1 uppercase · 1 number"
+          x-model="password"
+          minlength="8"
+          required autocomplete="new-password"
+        />
+        <!-- Strength meter -->
+        <div class="strength-bars" :class="`strength-${strength}`">
+          <div class="strength-bar"></div>
+          <div class="strength-bar"></div>
+          <div class="strength-bar"></div>
+          <div class="strength-bar"></div>
+        </div>
+        <div class="strength-label" :class="`strength-${strength}`" x-show="password.length > 0" x-text="strengthLabel"></div>
+      </div>
+
+      <!-- Message container for errors/success -->
+      <div id="registerMessage" class="register-message" style="display: none;"></div>
+
+      <button
+        type="submit"
+        id="submitBtn"
+        class="btn btn-primary btn-full"
+      >
+        Create Free Account
+      </button>
+    </form>
+
+    <p style="text-align:center; margin-top:1.4rem; font-size:.8rem; color:var(--ghost)">
+      Already have an account?
+      <a href="/login">Sign in</a>
+    </p>
+
+    <p style="text-align:center; margin-top:1rem; font-size:.7rem; color:var(--muted); line-height:1.6">
+      By creating an account you agree to our Terms of Service and Privacy Policy.
+    </p>
+  </div>
+</div>
+
+<script>
+document.getElementById('registerForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  
+  // Get form elements
+  const form = e.target;
+  const username = document.getElementById('username').value.trim();
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  const submitBtn = document.getElementById('submitBtn');
+  const messageDiv = document.getElementById('registerMessage');
+  
+  // Hide any previous message
+  messageDiv.style.display = 'none';
+  messageDiv.className = 'register-message';
+  
+  // Validate inputs
+  if (!username || !email || !password) {
+    showMessage('All fields are required', 'error');
+    return;
+  }
+  
+  if (password.length < 8) {
+    showMessage('Password must be at least 8 characters long', 'error');
+    return;
+  }
+  
+  // Show loading state
+  submitBtn.disabled = true;
+  submitBtn.innerHTML = '<span class="spinner"></span> Creating account...';
+  
+  try {
+    // Prepare request data
+    const requestData = {
+      username: username,
+      email: email,
+      password: password
+    };
+    
+    console.log('Sending registration request:', requestData);
+    
+    // Send POST request to API
+    const response = await fetch('/api/v1/auth/register', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestData)
+    });
+    
+    // Parse response JSON
+    const data = await response.json();
+    console.log('Registration response:', data);
+    
+    if (response.ok) {
+      // Registration successful
+      showMessage('Account created successfully! Redirecting to dashboard...', 'success');
+      
+      // Redirect to dashboard after 2 seconds
+      setTimeout(() => {
+        window.location.href = '/dashboard';
+      }, 2000);
+    } else {
+      // Handle validation errors
+      let errorMessage = 'Registration failed. Please try again.';
+      
+      if (data.detail) {
+        if (Array.isArray(data.detail)) {
+          // Pydantic validation error
+          errorMessage = data.detail.map(err => {
+            if (err.msg) return err.msg;
+            if (err.message) return err.message;
+            return JSON.stringify(err);
+          }).join('<br>');
+        } else if (typeof data.detail === 'string') {
+          errorMessage = data.detail;
+        } else if (data.detail.message) {
+          errorMessage = data.detail.message;
+        }
+      }
+      
+      showMessage(errorMessage, 'error');
+      
+      // Re-enable submit button
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = 'Create Free Account';
+    }
+  } catch (error) {
+    console.error('Registration error:', error);
+    showMessage('Network error. Please check your connection and try again.', 'error');
+    
+    // Re-enable submit button
+    submitBtn.disabled = false;
+    submitBtn.innerHTML = 'Create Free Account';
+  }
+});
+
+// Helper function to show messages
+function showMessage(text, type) {
+  const messageDiv = document.getElementById('registerMessage');
+  messageDiv.textContent = text;
+  messageDiv.className = `register-message ${type}`;
+  messageDiv.style.display = 'block';
+  
+  // Auto-hide error messages after 5 seconds
+  if (type === 'error') {
+    setTimeout(() => {
+      messageDiv.style.display = 'none';
+    }, 5000);
+  }
+}
+
+// Show popup message
+function showPopupMessage(text, type) {
+  const msgDiv = document.getElementById('popupMessage');
+  if (!msgDiv) return;
+  
+  msgDiv.textContent = text;
+  msgDiv.style.display = 'block';
+  msgDiv.style.background = type === 'error' ? 'var(--plasma)' : 
+                           type === 'success' ? 'var(--neon)' : 'var(--electric)';
+  msgDiv.style.color = type === 'error' ? 'white' : 'black';
+  
+  setTimeout(() => {
+    msgDiv.style.display = 'none';
+  }, 3000);
+}
+
+// Add this for Alpine.js compatibility if needed
+document.addEventListener('alpine:init', () => {
+  // Any Alpine.js initialization if needed
+});
+</script>
+
+{% endblock %}
