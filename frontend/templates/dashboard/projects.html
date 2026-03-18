@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}All Projects — ChisCode{% endblock %}
+
+{% block head %}
+<style>
+  .proj-table { width:100%;border-collapse:collapse }
+  .proj-table th { font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--ghost);padding:.5rem 1rem;text-align:left;border-bottom:1px solid var(--border) }
+  .proj-table td { padding:.75rem 1rem;border-bottom:1px solid rgba(255,255,255,.04);font-size:.85rem;vertical-align:middle }
+  .proj-table tr:hover td { background:var(--raised) }
+  .proj-name { font-weight:700;color:var(--white) }
+  .proj-meta { font-size:.73rem;color:var(--muted);margin-top:.15rem }
+  .stack-pill { font-size:.65rem;font-family:var(--font-code);background:var(--raised);border:1px solid var(--border);border-radius:4px;padding:.15rem .45rem;color:var(--ghost);white-space:nowrap }
+  .action-row { display:flex;gap:.35rem;justify-content:flex-end }
+  .filter-bar { display:flex;gap:.5rem;margin-bottom:1.25rem;flex-wrap:wrap;align-items:center }
+  .filter-chip { padding:.3rem .75rem;border:1px solid var(--border);border-radius:20px;background:transparent;color:var(--ghost);font-size:.72rem;cursor:pointer;transition:all .12s }
+  .filter-chip:hover,.filter-chip.active { border-color:var(--electric);color:var(--electric) }
+  .filter-chip.active { background:rgba(0,229,255,.08) }
+</style>
+{% endblock %}
+
+{% block body %}
+<nav class="nav">
+  <a href="/dashboard" style="display:flex;align-items:center;gap:.4rem;color:var(--ghost);font-size:.8rem;text-decoration:none;margin-right:1rem">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+    Dashboard
+  </a>
+  <a href="/" class="nav__logo">Chis<span>Code</span></a>
+  <div class="nav__links">
+    <button class="btn btn-primary btn-sm" onclick="window.location.href='/dashboard'">
+      + New Project
+    </button>
+  </div>
+</nav>
+
+<div style="max-width:1100px;margin:0 auto;padding:1.5rem 1rem 3rem">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem">
+    <div>
+      <h1 style="font-family:var(--font-display);font-size:1.4rem;font-weight:800;margin-bottom:.2rem">All Projects</h1>
+      <p style="color:var(--ghost);font-size:.82rem" id="proj-count"></p>
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <input id="search-input" class="form-input" type="text" placeholder="Search projects…"
+      style="max-width:240px" oninput="filterProjects()">
+    <button class="filter-chip active" data-status="" onclick="setStatus(this,'')">All</button>
+    <button class="filter-chip" data-status="complete" onclick="setStatus(this,'complete')">Complete</button>
+    <button class="filter-chip" data-status="generating" onclick="setStatus(this,'generating')">Active</button>
+    <button class="filter-chip" data-status="failed" onclick="setStatus(this,'failed')">Failed</button>
+  </div>
+
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden">
+    <table class="proj-table">
+      <thead>
+        <tr>
+          <th>Project</th>
+          <th>Stack</th>
+          <th>Files</th>
+          <th>Updated</th>
+          <th>Status</th>
+          <th style="text-align:right">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="proj-tbody">
+        <tr><td colspan="6" style="text-align:center;padding:2.5rem;color:var(--muted)">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const API = '/api/v1';
+const STATUS_COLOR = {
+  complete:'neon',failed:'plasma',generating:'electric',pending:'ghost',
+  awaiting_confirmation:'amber',committing:'amber',cancelled:'ghost',
+  analyzing:'electric',quality_check:'electric',self_healing:'amber',
+};
+let _allProjects = [];
+let _statusFilter = '';
+
+async function apiFetch(path, opts={}) {
+  const res = await fetch(API+path, { credentials:'include', ...opts });
+  if (res.status===401) { window.location.href='/login'; return null; }
+  return res;
+}
+
+async function load() {
+  const res = await apiFetch('/projects/?limit=200');
+  if (!res) return;
+  _allProjects = await res.json();
+  document.getElementById('proj-count').textContent = _allProjects.length + ' project' + (_allProjects.length!==1?'s':'');
+  render();
+}
+
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function render() {
+  const search = document.getElementById('search-input').value.toLowerCase();
+  const rows = _allProjects.filter(p => {
+    if (_statusFilter && p.status !== _statusFilter) return false;
+    if (search && !p.name.toLowerCase().includes(search) && !(p.description||'').toLowerCase().includes(search)) return false;
+    return true;
+  });
+
+  const tbody = document.getElementById('proj-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:2.5rem;color:var(--muted)">No projects match your filters.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(p => {
+    const stack  = p.stack ? [p.stack.frontend,p.stack.backend,p.stack.database].filter(Boolean) : [];
+    const isOk   = p.status==='complete';
+    const isLive = ['generating','analyzing','pending','quality_check','self_healing'].includes(p.status);
+    return `<tr>
+      <td>
+        <div class="proj-name">${escHtml(p.name)}</div>
+        <div class="proj-meta">${escHtml((p.description||'').slice(0,60))}${(p.description||'').length>60?'…':''}</div>
+      </td>
+      <td>${stack.slice(0,2).map(s=>`<span class="stack-pill">${escHtml(s)}</span>`).join(' ')}</td>
+      <td style="color:var(--ghost)">${p.file_count||0}</td>
+      <td style="color:var(--ghost);white-space:nowrap">${new Date(p.updated_at).toLocaleDateString()}</td>
+      <td><span class="badge badge-${STATUS_COLOR[p.status]||'ghost'}">${p.status.replace(/_/g,' ')}</span></td>
+      <td>
+        <div class="action-row">
+          ${isLive?`<a href="/dashboard" class="btn btn-sm" style="color:var(--amber);border-color:rgba(255,179,0,.3);background:rgba(255,179,0,.08)">Resume</a>`:''}
+          ${isOk?`<a href="/projects/${p._id}/deploy" class="btn btn-ghost btn-sm">Deploy</a>`:''}
+          <a href="/projects/${p._id}" class="btn btn-ghost btn-sm">Open</a>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function setStatus(el, status) {
+  document.querySelectorAll('.filter-chip').forEach(b=>b.classList.remove('active'));
+  el.classList.add('active');
+  _statusFilter = status;
+  render();
+}
+function filterProjects() { render(); }
+
+load();
+</script>
+{% endblock %}
