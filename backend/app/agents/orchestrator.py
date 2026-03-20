@@ -289,12 +289,12 @@ async def node_quality(state: ProjectState) -> ProjectState:
             await _push(state, "log", message="✅ Quality check passed")
 
         file_count = result.get("file_count", len(state.get("file_tree", {})))
-        state["status"] = "awaiting_confirmation"
+        state["status"] = "complete"
 
         await _call_tool("project_write", {
             "project_id": state["project_id"],
             "fields": {
-                "status":    "awaiting_confirmation",
+                "status":    "complete",
                 "file_tree": state.get("file_tree", {}),
             },
         })
