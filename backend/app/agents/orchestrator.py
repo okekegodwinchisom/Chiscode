@@ -545,7 +545,7 @@ def build_github_graph() -> StateGraph:
     return g.compile()
 
 
-def build_iterate_graph()
+def build_iterate_graph() -> StateGraph:
     """Iterate: plan changes → parallel patch → PR."""
     g = StateGraph(ProjectState)
     g.add_node("iterate", node_iterate)
