@@ -1,0 +1,2952 @@
+Let's integrate Tencent DB via sqlite to this orchestration workflow for agentic memory,context awareness, file structure, files content, project structure,
+"""
+ChisCode — MCP Orchestrator
+============================
+LangGraph StateGraph workflows that wire MCP tools together.
+
+Every node in the graph calls an MCP tool via _call_tool().
+This means the graph is purely a coordination layer — all
+actual work happens inside the MCP server tools.
+
+Five workflows:
+  1. analyze_workflow  — prompt analysis + HITL stack selection
+  2. plan_workflow     — architecture plan generation + HITL plan selection
+  3. generate_workflow — scaffold → generate → quality (full pipeline)
+  4. github_workflow   — standalone repo creation + push
+  5. iterate_workflow  — iterate on existing project, commit to main
+
+State flows through a typed ProjectState TypedDict.
+SSE events are yielded from run_workflow() as strings.
+
+ADK Integration
+================
+Phase 1 — node_quality: LoopAgent drives the static-analysis fix loop.
+          MAX_HEAL_ITERATIONS ceiling prevents runaway Codestral calls.
+          HealCheckerAgent escalates early when no issues remain.
+          All files healed concurrently via asyncio.gather.
+
+Phase 2 — node_generate: ParallelAgent replaces the manual asyncio
+          Semaphore + drain-queue fan-out.  PlannerAndRunner BaseAgent
+          dynamically creates one FileGenWorker per file at runtime
+          (file list only known after scaffold), wraps them in a
+          ParallelAgent, and assembles gen:file_tree from state keys.
+
+Phase 2b — node_iterate: IteratePatcher BaseAgent replaces the manual
+          asyncio.Queue + _patch_one drain loop with the same
+          ParallelAgent pattern used by node_generate.
+
+Phase 3 — build_generate_graph: scaffold → generate → quality expressed
+          as a deterministic LangGraph chain where each node internally
+          delegates to ADK primitives (SequentialAgent semantics without
+          a wrapping runner that would complicate SSE plumbing).
+
+Phase 4 (optional resilience) — ReflectAndRetryToolPlugin on the
+          InMemoryRunner instances guards MCP _call_tool() roundtrips
+          against transient 503s from Hugging Face Spaces cold starts.
+          Enabled via settings.adk_retry_enabled flag.
+
+Unchanged:
+  _push / _SSE_QUEUES / _call_tool — SSE adapter is future work.
+  node_analyze, node_plan, node_github_push — linear MCP nodes.
+  analyze_env_secrets — standalone utility, no orchestration.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Literal, TypedDict, List, Dict, Optional  # ← ADD List
+import json as _json
+from typing import Dict
+import re as _re
+import re
+import os
+import time
+from langgraph.graph import END, START, StateGraph
+from collections import defaultdict
+from app.agents.nodes.pyright_node import pyright_analysis_node
+from app.parser.ast_grep_wrapper import get_ast_grep
+from app.llm.tool_schemas import (
+    ToolCallValidator,
+    get_structured_tool_call,
+    ToolCall,
+    ToolCallSequence,
+)
+from app.llm.token_compactor import get_token_compactor, get_context_manager
+
+from google.adk.agents import (
+    BaseAgent,
+    LlmAgent,
+    LoopAgent,
+    ParallelAgent,
+    SequentialAgent,
+)
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events import Event, EventActions
+from google.adk.runners import InMemoryRunner
+from google.genai import types as genai_types
+from typing_extensions import override
+# ─────────────────────────────────────────────────────────────────────────────
+from app.core.logging import get_logger
+from typing import TYPE_CHECKING
+from app.core.logging import get_logger
+from app.agents.prompts.system_prompts import build_system_prompt
+from app.agents.prompts.stack_detection import get_stack_description
+from app.core.config import settings
+from app.core.monitoring import (
+    graph_run_span,
+    graph_node_span,
+    file_generation_span,
+    record_file_generated,
+    record_llm_call,
+    OTEL_ATTRS,
+    _sanitize_state,
+)
+
+# ── Add with other quality_checks imports ────────────────────────
+from app.agents.quality_checks import (
+    BINARY_EXT,
+    SKIP_HEAL_PATHS,
+    run_static_analysis,
+    auto_generate_readme,
+    auto_generate_env_example,
+    auto_generate_favicons,
+    inject_missing_package_deps,
+    find_missing_planned_files,
+    filter_auto_generated_issues,
+    log_skillopt_trajectories,
+    enforce_stack_rules,
+    auto_fix_missing_imports,
+    auto_fix_runtime_imports,
+    auto_fix_missing_schema_classes,
+    auto_fix_missing_database_functions,
+    validate_template_routes,
+    fix_router_prefixes,  # ← ADD THIS
+    fix_main_py_issues,
+    
+)
+
+# Add these imports after the existing ones
+from app.services.skill_trajectory_service import (
+    log_generation_outcome,
+    log_skill_snapshot,
+    log_heal_trajectory,
+)
+from app.services.skill_optimizer_service import SkillOptimizer
+from app.agents.prompts.system_prompts import _load_generation_skill, _SKILL_VERSION
+from app.agents.coordination import pre_generation_coordination
+#───────────────────────────────────────────────────────────────────────────
+# NEW IMPORTS: Tenacity, Instructor, Tree-sitter
+# ─────────────────────────────────────────────────────────────────────────────
+from app.core.retry import _call_tool_with_retry
+from app.llm.structured import (
+    generate_structured,
+    HealFixResult,
+    FileEditAction,
+    FilePlanItem,
+    GenerationSkill,
+    get_structured_client,
+)
+from app.parser.tree_sitter_wrapper import (
+    get_parser,
+    TreeSitterParser,
+)
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+logger = get_logger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADK constants
+# ═══════════════════════════════════════════════════════════════════════════════
+# LiteLLM "mistral/" prefix routes to Mistral AI / Codestral endpoint.
+ADK_CODESTRAL_MODEL = "mistral/codestral-latest"
+
+# Maximum LoopAgent iterations for node_quality file fixes.
+MAX_HEAL_ITERATIONS = 7
+
+ADK_APP_NAME = "agents"
+
+os.environ.setdefault("MISTRAL_API_KEY", settings.codestral_api_key)
+
+# ═══════════════════════════════════════════════════════════════
+# State
+# ═══════════════════════════════════════════════════════════════
+class ProjectState(TypedDict, total=False):
+    # Inputs
+    project_id:           str
+    user_id:              str
+    prompt:               str
+    project_name:         str
+    github_token:         str
+
+    # Analysis
+    spec:                 dict
+    stack:                dict
+    stack_options:        list[dict]
+    file_plan:            list[str]
+
+    # Generation
+    file_tree:            dict[str, str]
+    issues:               list[str]
+
+    # GitHub
+    repo_url:             str
+    commit_sha:           str
+    pr_url:               str
+    github_owner:         str
+    github_repo_name:     str
+
+    # Preview
+    preview_url:          str
+    daytona_workspace_id: str
+    preview_screenshot:   str
+
+    # Iterate
+    iterate_prompt:       str
+    version:              int
+
+    # Control flow
+    status:               str
+    error:                str | None
+    logs:                 list[str]
+
+    # SSE queue
+    _sse_queue:           asyncio.Queue
+
+
+def _fix_state_types(state: dict) -> dict:
+    """Coerce string fields back to their correct Python types."""
+    for key, empty, typ in [
+        ("file_plan",    [],  list),
+        ("file_tree",    {},  dict),
+        ("issues",       [],  list),
+        ("stack_options",[], list),
+    ]:
+        if key not in state:
+            continue
+        val = state[key]
+        if isinstance(val, str):
+            try:
+                state[key] = json.loads(val)
+            except Exception:
+                state[key] = empty
+        elif not isinstance(val, typ):
+            state[key] = empty
+    return state
+
+# ═══════════════════════════════════════════════════════════════
+# MCP Client helper (MODIFIED with Tenacity, Tree-sitter, ToolCallValidator)
+# ═══════════════════════════════════════════════════════════════
+
+async def _call_tool(tool: str, params: dict) -> dict:
+    """
+    Wrapper with Tenacity retry logic.
+    Now also validates generated code with Tree-sitter before writing.
+    Uses ToolCallValidator to prevent markdown loops.
+    """
+    
+    # ── NEW: Validate tool call format ─────────────────────────────
+    if isinstance(params, str):
+        # If params is a string, it might be free-form text from LLM
+        tool_call = ToolCallValidator.validate_tool_call(params)
+        if tool_call:
+            tool = tool_call.tool_name
+            params = tool_call.arguments
+            logger.info(f"Validated tool call: {tool}")
+        else:
+            # Try to extract from free text
+            extracted = ToolCallValidator._extract_from_free_text(params)
+            if extracted:
+                tool = extracted.tool_name
+                params = extracted.arguments
+                logger.warning(f"Extracted tool call from free text: {tool}")
+    
+    # ── NEW: Validate with Tree-sitter ──────────────────────────────
+    if tool == "code_generator" and "content" in params:
+        filename = params.get("filename", "")
+        content = params.get("content", "")
+        if filename and content:
+            try:
+                parser = get_parser()
+                is_valid, errors = parser.validate_syntax(filename, content)
+                if not is_valid:
+                    logger.warning(
+                        f"Generated {filename} has syntax errors: {errors[:3]}",
+                        filename=filename,
+                        errors=len(errors),
+                    )
+                    # ── NEW: Try to fix with ast-grep ─────────────────────
+                    ast_grep = get_ast_grep()
+                    fixed_content = ast_grep.fix_all(content, filename)
+                    if fixed_content != content:
+                        params["content"] = fixed_content
+                        logger.info(f"ast-grep fixed syntax in {filename}")
+            except Exception as exc:
+                logger.debug(f"Tree-sitter validation skipped for {filename}: {exc}")
+    
+    # ── Call with retry ─────────────────────────────────────────
+    return await _call_tool_with_retry(tool, params)
+
+def _sse(event: str, **data) -> str:
+    return f"data: {json.dumps({'event': event, **data})}\n\n"
+
+
+_SSE_QUEUES: Dict[str, asyncio.Queue] = {}
+
+def _register_queue(project_id: str) -> asyncio.Queue:
+    """Create and register a queue for this project's SSE stream."""
+    q = asyncio.Queue()
+    _SSE_QUEUES[project_id] = q
+    return q
+
+
+def _unregister_queue(project_id: str) -> None:
+    _SSE_QUEUES.pop(project_id, None)
+
+
+async def _push(state: dict, event: str, **kwargs) -> None:
+    """Push SSE event to the project's registered queue."""
+    project_id = state.get("project_id", "")
+    if not project_id:
+        logger.warning(f"_push called without project_id for event: {event}")
+        return
+
+    # FIX: Ensure payload is a JSON string
+    payload = json.dumps({"event": event, **kwargs})
+    logger.info(f"_push: project={project_id}, event={event}")
+    
+    q = _SSE_QUEUES.get(project_id)
+    if q is None:
+        logger.warning("No SSE queue for project", project_id=project_id, event=event)
+        return
+
+    await q.put(payload)
+        
+async def run_workflow(
+    graph,
+    initial_state: dict,
+) -> AsyncGenerator[str, None]:
+    """
+    Register SSE queue, run graph in background,
+    yield SSE events from queue as they arrive.
+    """
+    project_id = initial_state.get("project_id", "")
+    queue      = _register_queue(project_id)
+
+    # Run graph in background — _push calls will find the queue
+    graph_task = asyncio.create_task(graph.ainvoke(initial_state))
+
+    try:
+        while True:
+            # Wait for next event with timeout
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=300.0)
+                yield f"data: {payload}\n\n"
+
+                # Stop on terminal events
+                try:
+                    parsed = _json.loads(payload)
+                    if parsed.get("event") in ("complete", "error"):
+                                               
+                        break
+                except Exception:
+                    pass
+
+            except asyncio.TimeoutError:
+                # Send keepalive ping
+                yield "data: {\"event\":\"ping\"}\n\n"
+                # Check if graph is done
+                if graph_task.done():
+                    break
+
+    finally:
+        _unregister_queue(project_id)
+
+    # Surface any graph exception
+    if graph_task.done() and not graph_task.cancelled():
+        try:
+            exc = graph_task.exception()
+            if exc:
+                yield (f'data: {{"event":"error",'
+                       f'"message":"{str(exc)[:200]}"}}\n\n')
+        except Exception:
+            pass
+            
+def _strip_fences(text: str) -> str:
+    import re
+    text = text.strip()
+    text = re.sub(r"^```(?:\w+)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+def _stack_desc(stack: dict) -> str:
+    parts = [v for k, v in stack.items()
+             if k in ("frontend", "backend", "database")
+             and v and v.lower() != "none"]
+    return " + ".join(parts) if parts else "HTML/CSS/JS"
+
+
+def _safe_name(filename: str) -> str:
+    """Convert a filepath to a safe ADK agent name segment."""
+    return _re.sub(r"[^a-zA-Z0-9_]", "_", filename)[:30]
+
+def _make_runner(agent: BaseAgent, app_name: str = "agents") -> InMemoryRunner:
+    try:
+        if getattr(settings, "adk_retry_enabled", False):
+            from google.adk.plugins import ReflectAndRetryToolPlugin
+            return InMemoryRunner(
+                agent=agent,
+                app_name=app_name,
+                plugins=[ReflectAndRetryToolPlugin(
+                    max_retries=2,
+                    throw_exception_if_retry_exceeded=False,
+                )],
+            )
+    except (ImportError, AttributeError):
+        pass
+    return InMemoryRunner(agent=agent, app_name=app_name)
+    
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADK Phase 1 — Self-Heal LoopAgent  (used by node_quality)
+# ═══════════════════════════════════════════════════════════════════════════════
+class HealCheckerAgent(BaseAgent):
+    """
+    Escalates (exits the loop) when CodestralFixerAgent produced
+    non-trivial output.  Otherwise lets the loop retry.
+    """
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        result   = ctx.session.state.get("heal:result", "")
+        is_fixed = len(result.strip()) > 20
+
+        if is_fixed:
+            yield Event(
+                author=self.name,
+                actions=EventActions(
+                    escalate=True,
+                    state_delta={"heal:done": True},
+                ),
+                content=genai_types.Content(
+                    parts=[genai_types.Part(text="fix accepted — escalating")]
+                ),
+            )
+        else:
+            yield Event(
+                author=self.name,
+                actions=EventActions(state_delta={"heal:done": False}),
+                content=genai_types.Content(
+                    parts=[genai_types.Part(text="fix insufficient — retrying")]
+                ),
+            )
+
+
+def _build_heal_loop(stack_desc: str) -> LoopAgent:
+    """Factory — fresh LoopAgent per file (session state differs per file)."""
+    fixer = LlmAgent(
+        name="CodestralFixerAgent",
+        model=ADK_CODESTRAL_MODEL,
+        instruction=(
+            f"You are an expert {stack_desc} developer.\n"
+            "Read the file path, fixes, and current content from context.\n"
+            "Apply ALL listed fixes and return the COMPLETE corrected file.\n"
+            "Output ONLY raw file content — no markdown fences, no explanations.\n"
+            "If the file cannot be meaningfully fixed, respond with exactly: ESCALATE"
+            "1. For Alembic: NEVER use op.f() - use the index name as a string\n"
+            "2. For Python: add type hints to all functions\n"
+            "3. For imports: check the project structure and use correct paths\n"
+            "4. For FastAPI: use router = APIRouter() pattern\n"
+            "5. Close all parentheses, brackets, and quotes\n\n"
+            "6. For HTML templates: add {% extends 'base.html' %} if missing\n"
+            "7. For HTML templates: close ALL {% block %} with {% endblock %}\n"
+            "Read the file content and error messages carefully.\n"
+            "Return the COMPLETE fixed file.\n"
+        ),
+        output_key="heal:result",
+    )
+    return LoopAgent(
+        name="SelfHealLoop",
+        sub_agents=[fixer, HealCheckerAgent(name="HealCheckerAgent")],
+        max_iterations=MAX_HEAL_ITERATIONS,
+    )
+
+# In _run_heal_loop_for_file, replace the raw CodestralFixerAgent with:
+
+async def _run_heal_loop_for_file(
+    filepath:         str,
+    original_content: str,
+    fix_list:         list[str],
+    stack_desc:       str,
+    project_id:       str,
+    file_tree: dict = None,
+) -> str | None:
+    """
+    Spin up an ADK InMemoryRunner for one file's heal LoopAgent.
+    Returns fixed content or None on failure/ESCALATE.
+    Self-contained so multiple files can run concurrently via asyncio.gather.
+    """
+    
+    fixes_text    = "\n".join(f"- {fx}" for fx in fix_list)
+    context_block = (
+        f"File: {filepath}\n\n"
+        f"Fixes to apply:\n{fixes_text}\n\n"
+        f"Current content:\n{original_content[:8000]}\n\n"
+        "Return the complete fixed file."
+    )
+       # ── NEW: Use Tree-sitter to get context from similar files ──
+    context_from_similar = ""
+    try:
+        parser = get_parser()
+        if file_tree:
+            context_from_similar = parser.get_project_context(file_tree, filepath, max_files=5)
+            if context_from_similar:
+                context_block += f"\n\nContext from similar files:\n{context_from_similar}\n\n"
+    except Exception as exc:
+        logger.debug(f"Tree-sitter context failed: {exc}")
+ 
+    # ── NEW: Use Instructor for structured healing ──────────────
+    try:
+        # Try Instructor first for cleaner results
+        result: HealFixResult = await generate_structured(
+            prompt=(
+                f"File: {filepath}\n"
+                f"Fixes to apply:\n{fixes_text}\n\n"
+                f"Current content (first 8000 chars):\n{original_content[:8000]}\n\n"
+                f"Context:\n{context_from_similar[:500] if context_from_similar else 'None'}\n\n"
+                "Apply ALL listed fixes and return the complete corrected file."
+            ),
+            response_model=HealFixResult,
+            system_prompt=(
+                f"You are an expert {stack_desc} developer fixing code issues.\n"
+                "Apply all fixes and return the complete corrected file.\n"
+                "If the file cannot be meaningfully fixed, set status to 'escalate'.\n"
+                "If partial fixes apply, set status to 'partial' and list remaining issues."
+            ),
+            temperature=0.1,
+        )
+        
+        if result.status == "fixed" and result.content:
+            # Validate with Tree-sitter before returning
+            parser = get_parser()
+            is_valid, errors = parser.validate_syntax(filepath, result.content)
+            if is_valid:
+                logger.info(f"Heal succeeded for {filepath}", 
+                           changes=len(result.changes_made))
+                return result.content
+            else:
+                logger.warning(f"Heal result has syntax errors: {errors[:3]}", 
+                              filepath=filepath)
+                # Fall through to ADK loop as backup
+    except Exception as exc:
+        logger.warning(f"Instructor heal failed, falling back to ADK: {exc}")
+        # Continue to ADK loop below
+ 
+    # ── LEGACY: ADK LoopAgent as fallback ────────────────────────
+
+    initial_state = {
+        "heal:filepath":   filepath,
+        "heal:original":   original_content[:8000],
+        "heal:fixes":      fixes_text,
+        "heal:stack_desc": stack_desc,
+        "heal:context":    context_block,
+        "heal:result":     "",
+        "heal:done":       False,
+    }
+
+    runner = _make_runner(_build_heal_loop(stack_desc))
+
+    session = await runner.session_service.create_session(
+        app_name=runner.app_name,
+        user_id=project_id or "anon",
+        state=initial_state,
+    )
+    start_time = time.time()
+    attempt = 1
+    errors_seen = fix_list
+    errors_resolved = []
+    
+    try:
+        async for _ in runner.run_async(
+            user_id=project_id or "anon",
+            session_id=session.id,
+            new_message=genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(text=context_block)],
+            ),
+        ):
+            pass
+
+        final = await runner.session_service.get_session(
+            app_name=runner.app_name,
+            user_id=project_id or "anon",
+            session_id=session.id,
+        )
+        result = final.state.get("heal:result", "")
+        result = _re.sub(r"^```[\w]*\n?", "", result.strip())
+        result = _re.sub(r"\n?```$",      "", result)
+
+        if result.strip() == "ESCALATE" or len(result.strip()) <= 20:
+            logger.warning("heal_loop: fix rejected", filepath=filepath)
+            errors_remaining = errors_seen
+            verified = False
+            exhausted = True
+            return None
+        else:
+            errors_resolved = errors_seen
+            errors_remaining = []
+            verified = True
+            exhausted = False
+
+            # ── Log heal trajectory ──────────────────────────────────────────
+            try:
+                from app.services.skill_trajectory_service import log_heal_trajectory
+                skill_content = _load_generation_skill()
+                skill_version = _SKILL_VERSION
+
+                await log_heal_trajectory(
+                    project_id=project_id,
+                    stack_desc=stack_desc,
+                    stack={},  # Pass the stack if available
+                    prompt=f"Fix {filepath}",
+                    skill_version=skill_version,
+                    skill_content=skill_content,
+                    skill_type="heal",
+                    attempt=attempt,
+                    errors_seen=errors_seen,
+                    errors_resolved=errors_resolved,
+                    errors_remaining=errors_remaining,
+                    files_modified=[filepath],
+                    files_created=[],
+                    verified=verified,
+                    exhausted=exhausted,
+                    time_to_heal_ms=int((time.time() - start_time) * 1000),
+                    iterations_to_heal=attempt,
+                    final_status="clean" if verified else "exhausted",
+                )
+                logger.debug("Heal trajectory logged", filepath=filepath)
+            except Exception as e:
+                logger.warning("Failed to log heal trajectory", error=str(e))
+
+            # ── Validate with Tree-sitter before returning ──────
+            parser = get_parser()
+            is_valid, errors = parser.validate_syntax(filepath, result)
+            if not is_valid:
+                logger.warning(f"Heal result has syntax errors: {errors[:3]}", 
+                              filepath=filepath)
+                # Still return it, but log the warning
+            
+            return result
+
+    except Exception as exc:
+        logger.warning("heal_loop: runner error",
+                       filepath=filepath, error=str(exc))
+        return None
+        
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADK Phase 2 — Parallel File Generation  (used by node_generate)
+# ═══════════════════════════════════════════════════════════════════════════════
+class FileGenWorker(BaseAgent):
+    """Generates exactly one file via the MCP code_generator tool."""
+    filename:      str
+    system_prompt: str
+    project_name:  str
+    stack_desc:    str
+    file_plan:     list[str]
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        filename      = self.filename
+        file_hint     = _build_file_hint(
+            filename, ctx.session.state.get("gen:stack", {}))
+        t_start       = time.time()
+        content       = ""
+        error         = ""
+
+        try:
+            result = await _call_tool("code_generator", {
+                "filename":      filename,
+                "system_prompt": self.system_prompt,
+                "user_prompt": (
+                    f"Generate the file: {filename}\n\n"
+                    f"Project: {self.project_name} ({self.stack_desc})\n"
+                    "Full project structure:\n"
+                    + "\n".join(f"  - {f}" for f in self.file_plan[:30])
+                    + ("\n  ..." if len(self.file_plan) > 30 else "")
+                    + "\n\n"
+                    + (f"File-specific: {file_hint}\n\n" if file_hint else "")
+                    + f"Generate ONLY the complete content for {filename}. "
+                      "No explanations, no markdown fences."
+                ),
+            })
+            content = result.get("content", "")
+            # ── NEW: Validate with Tree-sitter ──────────────────────
+            if content:
+                parser = get_parser()
+                is_valid, errors = parser.validate_syntax(filename, content)
+                if not is_valid:
+                    logger.warning(f"Generated {filename} has syntax errors: {errors[:3]}")
+                    # We still store it, but quality check will fix
+            
+        except Exception as exc:
+            error = str(exc)[:200]
+            logger.error("FileGenWorker: failed",
+                         filename=filename, error=error)
+
+        latency_ms = int((time.time() - t_start) * 1000)
+
+        yield Event(
+            author=self.name,
+            actions=EventActions(state_delta={
+                f"gen:file:{filename}":    content,
+                f"gen:error:{filename}":   error,
+                f"gen:latency:{filename}": latency_ms,
+            }),
+            content=genai_types.Content(parts=[genai_types.Part(
+                text=f"{'ok' if content else 'error'}: {filename} "
+                     f"({len(content)}b, {latency_ms}ms)"
+            )]),
+        )
+
+
+class PlannerAndRunner(BaseAgent):
+    """
+    Reads gen:file_plan from session state, dynamically creates one
+    FileGenWorker per file, wraps them in a ParallelAgent, runs it,
+    then assembles gen:file_tree from individual state keys.
+    """
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        file_plan     = ctx.session.state.get("gen:file_plan",     [])
+        system_prompt = ctx.session.state.get("gen:system_prompt", "")
+        project_name  = ctx.session.state.get("gen:project_name",  "App")
+        stack_desc    = ctx.session.state.get("gen:stack_desc",    "HTML/CSS/JS")
+
+        if not file_plan:
+            yield Event(
+                author=self.name,
+                actions=EventActions(
+                    state_delta={"gen:error:_plan": "empty file_plan"}),
+                content=genai_types.Content(
+                    parts=[genai_types.Part(text="ERROR: empty file_plan")]),
+            )
+            return
+
+        workers = [
+            FileGenWorker(
+                name=f"FileGen_{i}_{_safe_name(fname)}",
+                filename=fname,
+                system_prompt=system_prompt,
+                project_name=project_name,
+                stack_desc=stack_desc,
+                file_plan=file_plan,
+            )
+            for i, fname in enumerate(file_plan)
+        ]
+
+        async for event in ParallelAgent(
+            name="ParallelFileGenerator", sub_agents=workers
+        ).run_async(ctx):
+            yield event
+
+        # Assemble file_tree from state keys written by workers
+        file_tree = {
+            fname: ctx.session.state.get(f"gen:file:{fname}", "")
+            for fname in file_plan
+            if ctx.session.state.get(f"gen:file:{fname}")
+        }
+
+        yield Event(
+            author=self.name,
+            actions=EventActions(state_delta={"gen:file_tree": file_tree}),
+            content=genai_types.Content(parts=[genai_types.Part(
+                text=f"ParallelFileGenerator: {len(file_tree)}/{len(file_plan)} files"
+            )]),
+        )
+
+
+async def _run_parallel_generation(
+    file_plan:     list[str],
+    system_prompt: str,
+    project_name:  str,
+    stack_desc:    str,
+    stack:         dict,
+    project_id:    str,
+) -> dict[str, str]:
+    """InMemoryRunner wrapper for PlannerAndRunner — called by node_generate."""
+    runner = _make_runner(PlannerAndRunner(name="PlannerAndRunner"))
+
+    # Use runner.app_name as source of truth — always consistent with runner
+    session = await runner.session_service.create_session(
+        app_name=runner.app_name,
+        user_id=project_id or "anon",
+        state={
+            "gen:file_plan":     file_plan,
+            "gen:system_prompt": system_prompt,
+            "gen:project_name":  project_name,
+            "gen:stack_desc":    stack_desc,
+            "gen:stack":         stack,
+        },
+    )
+
+    async for _ in runner.run_async(
+        user_id=project_id or "anon",
+        session_id=session.id,
+        new_message=genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(
+                text=f"Generate {len(file_plan)} files for {project_name}."
+            )],
+        ),
+    ):
+        pass
+
+    final = await runner.session_service.get_session(
+        app_name=runner.app_name,
+        user_id=project_id or "anon",
+        session_id=session.id,
+    )
+    return final.state.get("gen:file_tree", {})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADK Phase 2b — Parallel Patch Workers  (used by node_iterate)
+# ═══════════════════════════════════════════════════════════════════════════════
+class FilePatchWorker(BaseAgent):
+    """Patches or creates exactly one file for an iterate request."""
+    filename: str
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        filename       = self.filename
+        iterate_prompt = ctx.session.state.get("patch:iterate_prompt", "")
+        stack_desc     = ctx.session.state.get("patch:stack_desc",     "")
+        file_tree      = ctx.session.state.get("patch:file_tree",      {})
+
+        existing = file_tree.get(filename, "")
+        is_new   = filename not in file_tree
+        content  = ""
+        error    = ""
+
+        try:
+            result = await _call_tool("code_generator", {
+                "filename":      filename,
+                "system_prompt": (
+                    f"You are an expert {stack_desc} developer.\n"
+                    f"{'Create this new file' if is_new else 'Modify this existing file'} "
+                    "according to the change request.\n"
+                    "Output ONLY the complete file content."
+                ),
+                "user_prompt": (
+                    f"File: {filename}\n"
+                    f"Change request: {iterate_prompt}\n\n"
+                    + (f"Current content:\n{existing[:3000]}\n\n" if not is_new else "")
+                    + f"Return the complete {'new' if is_new else 'updated'} file."
+                ),
+            })
+            content = result.get("content", "")
+            # ── NEW: Validate with Tree-sitter ──────────────────────
+            if content:
+                parser = get_parser()
+                is_valid, errors = parser.validate_syntax(filename, content)
+                if not is_valid:
+                    logger.warning(f"Patched {filename} has syntax errors: {errors[:3]}")
+            
+        except Exception as exc:
+            error = str(exc)[:200]
+            logger.error("FilePatchWorker: failed",
+                         filename=filename, error=error)
+
+        yield Event(
+            author=self.name,
+            actions=EventActions(state_delta={
+                f"patch:file:{filename}":  content,
+                f"patch:error:{filename}": error,
+            }),
+            content=genai_types.Content(parts=[genai_types.Part(
+                text=f"{'ok' if content else 'error'}: {filename}"
+            )]),
+        )
+
+
+class IteratePatcher(BaseAgent):
+    """
+    Phase 2b — replaces the asyncio.Queue + _patch_one drain loop.
+    Reads patch:* state, runs FilePatchWorkers in parallel,
+    assembles patch:changed_files from individual state keys.
+    """
+    files_to_change: list[str]
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        files = self.files_to_change
+
+        workers = [
+            FilePatchWorker(
+                name=f"Patch_{_safe_name(fname)}",
+                filename=fname,
+            )
+            for fname in files
+        ]
+
+        async for event in ParallelAgent(
+            name="ParallelPatcher", sub_agents=workers
+        ).run_async(ctx):
+            yield event
+
+        changed = {
+            fname: ctx.session.state.get(f"patch:file:{fname}", "")
+            for fname in files
+            if ctx.session.state.get(f"patch:file:{fname}", "").strip()
+        }
+
+        yield Event(
+            author=self.name,
+            actions=EventActions(state_delta={"patch:changed_files": changed}),
+            content=genai_types.Content(parts=[genai_types.Part(
+                text=f"IteratePatcher: {len(changed)}/{len(files)} files patched"
+            )]),
+        )
+
+async def _run_parallel_patch(
+    files_to_change: list[str],
+    file_tree:       dict[str, str],
+    iterate_prompt:  str,
+    stack_desc:      str,
+    project_id:      str,
+) -> dict[str, str]:
+    """InMemoryRunner wrapper for IteratePatcher — called by node_iterate."""
+    runner = _make_runner(
+        IteratePatcher(
+            name="IteratePatcher",
+            files_to_change=files_to_change,
+        )
+    )
+
+    session = await runner.session_service.create_session(
+        app_name=runner.app_name,
+        user_id=project_id or "anon",
+        state={
+            "patch:iterate_prompt": iterate_prompt,
+            "patch:stack_desc":     stack_desc,
+            "patch:file_tree":      file_tree,
+        },
+    )
+
+    async for _ in runner.run_async(
+        user_id=project_id or "anon",
+        session_id=session.id,
+        new_message=genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(
+                text=f"Patch {len(files_to_change)} files: {iterate_prompt[:100]}"
+            )],
+        ),
+    ):
+        pass
+
+    final = await runner.session_service.get_session(
+        app_name=runner.app_name,
+        user_id=project_id or "anon",
+        session_id=session.id,
+    )
+    return final.state.get("patch:changed_files", {})
+
+async def _generate_missing_file_with_llm(
+    filepath: str,
+    spec: dict,
+    stack: dict,
+    file_tree: dict,
+    project_name: str,
+    stack_desc: str,
+) -> str | None:
+    """
+    Use LLM to intelligently generate a missing file based on project context.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_mistralai import ChatMistralAI
+
+    # ── NEW: Use Tree-sitter to get context from similar files ──
+    context_from_similar = ""
+    try:
+        parser = get_parser()
+        context_from_similar = parser.get_project_context(file_tree, filepath, max_files=10)
+        # Also get imports from similar files
+        imports_context = parser.get_imports_context(file_tree, filepath)
+        if imports_context:
+            context_from_similar += f"\n\nImports from similar files:\n{imports_context}"
+    except Exception as exc:
+        logger.debug(f"Tree-sitter context failed: {exc}")
+ 
+    # Determine file type and purpose
+    filename = filepath.split('/')[-1]
+    extension = filepath.split('.')[-1] if '.' in filepath else ''
+    directory = '/'.join(filepath.split('/')[:-1]) if '/' in filepath else ""
+    
+    # Build context from existing files
+    similar_files = []
+    for existing_path in list(file_tree.keys())[:20]:
+        if existing_path.endswith(f".{extension}") or extension in existing_path:
+            similar_files.append(f"  {existing_path}: {len(file_tree[existing_path])} chars")
+    
+    features = spec.get("features", [])
+    description = spec.get("description", "")
+    
+    # Build specific guidance based on file type
+    guidance = ""
+    if filepath.endswith(".css"):
+        guidance = "Generate Tailwind CSS or standard CSS with proper styling. Include CSS variables for theming."
+    elif filepath.endswith((".tsx", ".jsx")):
+        guidance = f"Generate a React/Next.js component for {filename}. Use TypeScript if applicable. Include proper exports."
+    elif filepath.endswith((".ts", ".js")):
+        guidance = "Generate a TypeScript/JavaScript module with proper exports and type definitions."
+    elif filepath.endswith(".py"):
+        guidance = "Generate a Python module with proper imports, type hints, and docstrings."
+    elif filepath.endswith(".html"):
+        guidance = "Generate a complete HTML5 document with proper structure and meta tags."
+    else:
+        guidance = f"Generate a complete {extension} file with best practices."
+    
+    prompt = f"""You are an expert {stack_desc} developer. Generate the missing file: {filepath}
+
+Project: {project_name}
+Description: {description}
+Features: {', '.join(features) if features else 'Standard web app'}
+
+Stack:
+- Frontend: {stack.get('frontend', 'N/A')}
+- Backend: {stack.get('backend', 'N/A')}
+- Database: {stack.get('database', 'N/A')}
+
+Existing project files (for context):
+{chr(10).join([f"  - {f}" for f in list(file_tree.keys())[:15]])}
+
+{chr(10).join(similar_files[:5])}
+
+Guidance:
+{guidance}
+
+Requirements:
+1. Generate COMPLETE content for {filepath}
+2. Follow {stack_desc} best practices
+3. Make it production-ready
+4. Include all necessary imports and exports
+5. If this is a page/route component, include appropriate routing
+6. If this is an API route, include proper request/response handling
+
+Return ONLY the raw file content. No markdown fences, no explanations, no extra text."""
+
+    try:
+        llm = ChatMistralAI(
+            model=settings.codestral_model,
+            api_key=settings.codestral_api_key,
+            base_url=settings.codestral_base_url,
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        
+        # Remove markdown fences if present
+        content = _strip_fences(content)
+
+        # ── NEW: Validate with Tree-sitter ──────────────────────────
+        if content:
+            parser = get_parser()
+            is_valid, errors = parser.validate_syntax(filepath, content)
+            if not is_valid:
+                logger.warning(f"Generated {filepath} has syntax errors: {errors[:3]}")
+                # Still return it, but quality check will fix
+       
+        # Validate content is reasonable
+        if len(content.strip()) < 50:
+            logger.warning(f"Generated content for {filepath} is too short")
+            return None
+        
+        return content
+        
+    except Exception as exc:
+        logger.error(f"Failed to generate {filepath}: {exc}")
+        return None
+
+def _validate_cross_file_imports(
+    file_tree: dict[str, str],
+    stack: dict,
+    file_plan: list[str],
+) -> dict[str, set[str]]:
+    """
+    Scan all .py files for imports from project modules that don't exist.
+    Returns {missing_module_path: {imported_name, ...}}
+    """
+    import re as _re_v
+    
+    missing: dict[str, set[str]] = {}
+    existing_files = set(file_tree.keys())
+    
+    be = (stack.get("backend") or "").lower()
+    if "python" not in be and "fastapi" not in be:
+        return missing
+    
+    # Project root prefixes that indicate internal imports
+    PROJECT_ROOTS = {"src", "app", "api", "core", "models", "schemas",
+                     "services", "utils", "config", "routers", "middleware",
+                     "db", "database"}
+
+    # ── NEW: Use Tree-sitter for Python imports ────────────────────
+    parser = get_parser()
+   
+    for filepath, content in file_tree.items():
+        if not filepath.endswith(".py") or not content:
+            continue
+        
+        # Match: from X.Y.Z import A, B, C
+        for match in _re_v.finditer(
+            r'from\s+([\w.]+)\s+import\s+(.+?)(?:\s*#|\s*\n|$)',
+            content
+        ):
+            module_path = match.group(1)
+            imports_raw = match.group(2)
+            
+            # Convert to file path
+            file_path = module_path.replace(".", "/") + ".py"
+            
+            # Skip if file exists
+            if file_path in existing_files:
+                continue
+            
+            # Skip if not a project module
+            first_part = module_path.split(".")[0]
+            if first_part not in PROJECT_ROOTS:
+                continue
+            
+            # Parse imported names (handle 'X, Y, Z' and 'X as Y')
+            names = set()
+            for name in imports_raw.split(","):
+                name = name.strip().split(" as ")[0].strip()
+                if name and not name.startswith("_"):
+                    names.add(name)
+            
+            if names:
+                if file_path not in missing:
+                    missing[file_path] = set()
+                missing[file_path].update(names)
+    
+    return missing
+
+
+async def _generate_missing_module(
+    module_path: str,
+    imported_names: set[str],
+    file_tree: dict[str, str],
+    stack: dict,
+    spec: dict,
+    project_name: str,
+) -> str | None:
+    """
+    Generate a complete Python module that exports the required names.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_mistralai import ChatMistralAI
+    
+    parts = [v for k, v in stack.items()
+             if k in ("frontend", "backend", "database")
+             and v and v.lower() != "none"]
+    stack_desc = " + ".join(parts) if parts else "Python"
+    
+    # Find context: which files import from this module
+    importers = []
+    target_module = module_path.replace(".py", "").replace("/", ".")
+    # ── NEW: Use Tree-sitter to find importers ────────────────────
+    parser = get_parser()
+    for fp, content in file_tree.items():
+        if fp.endswith(".py") and target_module in content:
+            # Try Tree-sitter first
+            imports = parser.get_imports(fp, content)
+            if imports:
+                for imp in imports:
+                    if imp.get("module") == target_module:
+                        importers.append(f"  {fp}: imports {', '.join(imp.get('names', []))}")
+                        break
+            else:
+                # Fallback to regex
+                for line in content.splitlines():
+                    if f"from {target_module}" in line:
+                        importers.append(f"  {fp}: {line.strip()}")
+    
+    prompt = f"""You are an expert {stack_desc} developer. Generate a COMPLETE module.
+
+File: {module_path}
+Required exports: {', '.join(sorted(imported_names))}
+
+This module is imported by:
+{chr(10).join(importers[:5]) if importers else '(detected from project imports)'}
+
+CRITICAL RULES:
+1. Generate COMPLETE implementations for ALL required exports
+2. Use Pydantic v2 (BaseModel, model_dump, NOT .dict())
+3. Use proper type hints everywhere
+4. If this is a schemas module, each export should be a Pydantic BaseModel
+5. If this is an auth/core module, include proper logic
+6. Include ALL necessary imports within this module
+7. NO placeholders, NO TODOs, NO pass statements for required exports
+
+Return ONLY the raw Python file content. No markdown fences."""
+
+    try:
+        llm = ChatMistralAI(
+            model=settings.codestral_model,
+            api_key=settings.codestral_api_key,
+            base_url=settings.codestral_base_url,
+            temperature=0.1,
+            max_tokens=4096,
+        )
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        content = _strip_fences(content)
+        
+        if len(content.strip()) < 50:
+            return None
+        
+        # Verify exports
+        for name in imported_names:
+            if f"class {name}" not in content and f"def {name}" not in content and f"{name} =" not in content:
+                logger.warning(f"Missing export {name} in generated {module_path}")
+        
+        return content
+    except Exception as exc:
+        logger.error(f"Failed to generate {module_path}: {exc}")
+        return None
+
+# ═══════════════════════════════════════════════════════════════
+# WORKFLOW 1 — Generate
+# Node: analyze
+# ═══════════════════════════════════════════════════════════════
+async def node_analyze(state: ProjectState) -> ProjectState:
+    await _push(state, "status", status="analyzing",
+                message="🔍 Analyzing requirements...")
+
+    try:
+        await _call_tool("project_write", {
+            "project_id": state["project_id"],
+            "fields":     {"status": "analyzing"},
+        })
+
+        result = await _call_tool("analyze_prompt", {
+            "prompt":       state["prompt"],
+            "project_name": state.get("project_name", "my-app"),
+        })
+        spec = result["spec"]
+
+        await _push(state, "log",
+                    message="🧠 Evaluating best tech stacks...")
+
+        stacks = await _call_tool("stack_advisor", {
+            "prompt":     state["prompt"],
+            "app_type":   spec.get("app_type",   "web_app"),
+            "complexity": spec.get("complexity", "moderate"),
+            "features":   spec.get("features",   []),
+        })
+
+        state["spec"]          = spec
+        state["stack_options"] = stacks["options"]
+        state["status"]        = "awaiting_stack_selection"
+
+        # ── Save to DB BEFORE pushing stack_suggestion ────────
+        # select-stack endpoint validates this status —
+        # must be persisted before the user can click the button
+        await _call_tool("project_write", {
+            "project_id": state["project_id"],
+            "fields": {
+                "spec":          spec,
+                "stack_options": stacks["options"],
+                "status":        "awaiting_stack_selection",  # ← persisted first
+            },
+        })
+
+        # ── Now safe to push — DB is already updated ──────────
+        await _push(state, "stack_suggestion",
+                    stacks=stacks["options"],
+                    message="Pick your tech stack to continue",
+                    project_id=state["project_id"])
+
+        logger.info("✅ stack_suggestion event sent")
+
+    except Exception as exc:
+        state["error"]  = str(exc)
+        state["status"] = "failed"
+        await _push(state, "error", message=f"Analysis failed: {exc}")
+        await _call_tool("project_write", {
+            "project_id": state["project_id"],
+            "fields": {"status": "failed", "error_message": str(exc)},
+        })
+
+    return state
+
+# ═══════════════════════════════════════════════════════════════
+# Node: auto_select_stack (NEW — replaces HITL)
+# ═══════════════════════════════════════════════════════════════
+async def node_auto_select_stack(state: ProjectState) -> ProjectState:
+    """
+    Auto-select the best stack from stack_options without user input.
+    Picks the first option (highest confidence) and saves to DB.
+    """
+    stack_options = state.get("stack_options", [])
+    
+    if not stack_options:
+        state["error"]  = "No stack options available"
+        state["status"] = "failed"
+        await _push(state, "error", message="No stack options from analysis")
+        return state
+    
+    # Auto-select first (best) option
+    best = stack_options[0]
+    chosen = {
+        "frontend": best.get("frontend", ""),
+        "backend":  best.get("backend",  ""),
+        "database": best.get("database", ""),
+        "extras":   best.get("extras",   []),
+    }
+    
+    state["stack"] = chosen
+    state["status"] = "stack_selected"
+    
+    await _push(state, "status", 
+                status="stack_detected",
+                message=f"🔍 Stack detected: {_stack_desc(chosen)}")
+    
+    await _call_tool("project_write", {
+        "project_id": state["project_id"],
+        "fields": {
+            "stack":  chosen,
+            "status": "generating",
+        },
+    })
+    
+    logger.info("Stack auto-selected", 
+                project_id=state["project_id"], 
+                stack=chosen)
+    
+    return state
+# ═══════════════════════════════════════════════════════════════
+# Node: scaffold_files
+# ═══════════════════════════════════════════════════════════════
+async def node_scaffold(state: ProjectState) -> ProjectState:
+    """Generate file plan based on spec and stack only (no architecture plans)."""
+    state = _fix_state_types(state)
+    project_id = state.get("project_id", "")
+    user_id = state.get("user_id", "")
+    spec = state.get("spec", {})
+    stack = state.get("stack", {})
+
+    sd = _stack_desc(stack)
+    project_name = spec.get("app_name", "")
+    frontend = (stack.get("frontend") or "").lower()
+
+    # Favicons only make sense for web frontend stacks
+    is_web_frontend = any(x in frontend for x in (
+        "next", "react", "svelte", "vue", "nuxt", "angular", "vite", "html"
+    ))
+
+    with graph_node_span(
+        "scaffold", project_id, user_id,
+        stack=sd, project_name=project_name, input_state=state,
+    ) as span:
+        await _push(state, "status", status="scaffolding",
+                    message="🏗 Planning project structure...")
+        try:
+            result = await _call_tool("file_scaffold", {
+                "spec": spec,
+                "stack": stack,
+            })
+            file_plan = result.get("files", [])
+
+            # ── NEW: Validate with Instructor ──────────────────────────
+            try:
+                from pydantic import TypeAdapter
+                plan_adapter = TypeAdapter(List[FilePlanItem])
+                validated_plan = plan_adapter.validate_python(
+                    [{"path": f, "purpose": "", "depends_on": []} for f in file_plan]
+                )
+                file_plan = [item.path for item in validated_plan]
+                logger.info(f"File plan validated with Instructor: {len(file_plan)} files")
+            except Exception as exc:
+                logger.warning(f"File plan validation failed, using raw: {exc}")
+            
+            # ── Inject essential files not already in plan ────────────────────
+            file_plan_set = set(file_plan)
+            injected: list[str] = []
+
+            # 1. README.md — every project always needs this
+            if "README.md" not in file_plan_set and "readme.md" not in file_plan_set:
+                file_plan.append("README.md")
+                file_plan_set.add("README.md")
+                injected.append("README.md")
+
+            # 2. .env.example — every project needs environment variables template
+            if ".env" not in file_plan_set:
+                file_plan.append(".env")
+                file_plan_set.add(".env")
+                injected.append(".env")
+
+            # 3. AGENT.md — AI agent developer guide
+            if "AGENT.md" not in file_plan_set and "agent.md" not in file_plan_set:
+                file_plan.append("AGENT.md")
+                file_plan_set.add("AGENT.md")
+                injected.append("AGENT.md")
+
+            # 4. Favicon — web frontend only (SVG is text, LLM can generate it)
+            if is_web_frontend:
+                if "public/favicon.svg" not in file_plan_set:
+                    file_plan.append("public/favicon.svg")
+                    file_plan_set.add("public/favicon.svg")
+                    injected.append("public/favicon.svg")
+
+            # 5. docs/README.md — documentation entry point
+            if "docs/README.md" not in file_plan_set:
+                file_plan.append("docs/README.md")
+                file_plan_set.add("docs/README.md")
+                injected.append("docs/README.md")
+
+            # ── NEW: Documentation files ──────────────────────────────────────
+            # 5. docs/Architecture.md — architecture documentation
+            if "docs/Architecture.md" not in file_plan_set:
+                file_plan.append("docs/Architecture.md")
+                file_plan_set.add("docs/Architecture.md")
+                injected.append("docs/Architecture.md")
+
+            # 6. docs/Deployment.md — deployment documentation
+            if "docs/Deployment.md" not in file_plan_set:
+                file_plan.append("docs/Deployment.md")
+                file_plan_set.add("docs/Deployment.md")
+                injected.append("docs/Deployment.md")
+
+            # 7. docs/API.md — API documentation (if backend is present)
+            backend = (stack.get("backend") or "").lower()
+            if "fastapi" in backend or "python" in backend or "node" in backend:
+                if "docs/API.md" not in file_plan_set:
+                    file_plan.append("docs/API.md")
+                    file_plan_set.add("docs/API.md")
+                    injected.append("docs/API.md")
+
+            # .gitignore — every project needs this
+            if ".gitignore" not in file_plan_set:
+                file_plan.append(".gitignore")
+                file_plan_set.add(".gitignore")
+                injected.append(".gitignore")
+
+            # .dockerignore — prevent Docker build bloat
+            if ".dockerignore" not in file_plan_set:
+                file_plan.append(".dockerignore")
+                file_plan_set.add(".dockerignore")
+                injected.append(".dockerignore")
+
+            # 6.── Inject PG Durable files into file plan ────────────
+            if "pg_durable" in stack.get("extras", []):
+                durable_files = [
+                    "src/services/task_queue.py",
+                    "src/services/outbox.py",
+                    "src/services/healer.py",
+                    "src/workers/__init__.py",
+                    "src/workers/task_processor.py",
+                    "alembic/versions/0002_durable_tables.py",
+                ]
+                for df in durable_files:
+                    if df not in file_plan_set:
+                        file_plan.append(df)
+                        file_plan_set.add(df)
+                        injected.append(df)
+                logger.info("Injected PG Durable files into plan", 
+                            project_id=project_id)
+
+            # ── WEB SEARCH: Get latest versions & API docs ──────
+            try:
+                from app.tools.web_search import search_for_stack
+                search_info = await search_for_stack(stack, spec)
+                logger.info(f"Web search returned {len(search_info)} chars")  # ← ADD THIS
+                if search_info:
+                    state["web_search_info"] = search_info
+                    await _push(state, "log",
+                                message="🔍 Searched web for latest API docs & versions")
+                    logger.info("Web search completed", project_id=project_id)
+            except Exception as exc:
+                logger.warning("Web search failed (non-fatal)", error=str(exc)[:200])
+    
+            if injected:
+                logger.info("node_scaffold: injected essential files",
+                            files=injected, project_id=project_id)
+                await _push(state, "log",
+                            message=f"📌 Ensuring: {', '.join(injected)}")
+
+            state["file_plan"] = file_plan
+
+            if span.is_recording():
+                span.set_attribute(OTEL_ATTRS["files_planned"], len(file_plan))
+                span.set_attribute("chiscode.scaffold.file_plan",
+                                   json.dumps(file_plan[:30]))
+                if injected:
+                    span.set_attribute("chiscode.scaffold.injected",
+                                       json.dumps(injected))
+
+            await _push(state, "plan",
+                        file_plan=file_plan,
+                        message=f"📋 {len(file_plan)} files planned"
+                                + (f" (+{len(injected)} essential)"
+                                   if injected else ""))
+
+            await _call_tool("project_write", {
+                "project_id": project_id,
+                "fields": {"file_plan": file_plan},
+            })
+
+        except Exception as exc:
+            state["error"] = str(exc)
+            state["status"] = "failed"
+            await _push(state, "error", message=f"Scaffold failed: {exc}")
+
+    return state
+# ═══════════════════════════════════════════════════════════════
+# Node: generate_files (parallel)
+# ═══════════════════════════════════════════════════════════════
+async def node_generate(state: ProjectState) -> ProjectState:
+    """
+    Generate all project files via ADK PlannerAndRunner + ParallelAgent.
+    Replaces the manual asyncio.Semaphore + drain-loop fan-out.
+    """
+    spec       = state.get("spec",       {})
+    stack      = state.get("stack",      {})
+    file_plan  = state.get("file_plan",  [])
+    project_id = state.get("project_id", "")
+    user_id    = state.get("user_id",    "")
+    project_name = spec.get("app_name", "App")
+    skill_content = _load_generation_skill()
+    skill_version = _SKILL_VERSION
+    
+    logger.info("node_generate: using skill version",
+                project_id=project_id,
+                skill_version=skill_version)
+    if not file_plan:
+        state["error"]  = "No file plan — run scaffold first"
+        state["status"] = "failed"
+        await _push(state, "error", message="No file plan available")
+        return state
+
+    sd       = _stack_desc(stack)
+    database = (stack.get("database") or "").lower()
+
+    system_prompt = build_system_prompt(
+        app_name=spec.get("app_name", "App"),
+        description=spec.get("description", ""),
+        features=spec.get("features", []),
+        auth_required=spec.get("auth_required", False),
+        database=database,
+        stack=stack,
+    )
+    # â”€â”€ NEW: Compact context before generation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    context_manager = get_context_manager()
+    token_compactor = get_token_compactor()
+    
+    # Compact the file plan and spec for the prompt
+    compacted_file_plan = token_compactor.compact_file_tree(
+        {f: "" for f in file_plan},
+        max_files=100,
+        include_sizes=False
+    )
+    
+    # Use context manager to build the prompt
+    system_prompt = context_manager.build_context(
+        system_prompt=system_prompt,
+        user_prompt=f"Generate {len(file_plan)} files for {project_name}",
+        code_context={f: "" for f in file_plan[:20]},
+        logs="",
+        errors=[],
+    )
+
+    # ── ADD WEB SEARCH RESULTS ──────────────────────────────────
+    web_search_info = state.get("web_search_info", "")
+    if web_search_info:
+        system_prompt += "\n\n" + web_search_info
+        system_prompt += "\n\n⚠ USE the latest version info above for ALL package versions and API endpoints."
+        logger.info("Injected web search results into generation prompt",
+                    project_id=project_id)
+
+    start_time = time.time()
+
+    logger.info("node_generate: starting (ADK ParallelAgent)",
+                project_id=project_id,
+                file_count=len(file_plan),
+                stack=sd)
+
+    await _push(state, "status",
+                status="generating",
+                message=f"🔥 Generating {len(file_plan)} files in parallel…",
+                total_files=len(file_plan),
+                progress=0)
+
+    try:
+        file_tree = await _run_parallel_generation(
+            file_plan=file_plan,
+            system_prompt=system_prompt,
+            project_name=project_name,
+            stack_desc=sd,
+            stack=stack,
+            project_id=project_id,
+        )
+    except Exception as exc:
+        state["error"]  = str(exc)
+        state["status"] = "failed"
+        await _push(state, "error", message=f"Generation failed: {exc}")
+        return state
+
+    # In node_generate, BEFORE calling _run_parallel_generation:
+    # ── NEW: Pre-generation coordination ──────────────────────────
+    try:
+        from app.agents.coordination import coordinate_generated_imports
+        
+        file_tree, coord_fixes = coordinate_generated_imports(file_tree, stack)
+        if coord_fixes:
+            await _push(state, "log", 
+                        message=f"🔗 Applied {len(coord_fixes)} coordination fixes")
+            for fix in coord_fixes[:5]:
+                await _push(state, "log", message=f"  - {fix}")
+            logger.info(f"Coordination fixes applied: {len(coord_fixes)}", 
+                        project_id=project_id, fixes=coord_fixes)
+    except Exception as exc:
+        logger.warning(f"Pre-generation coordination failed: {exc}")
+
+    # Progressive SSE events — workers are done, iterate assembled tree
+    completed = 0
+    # ── NEW: Validate all files with Tree-sitter ──────────────────
+    parser = get_parser()
+    syntax_errors = []
+    for filename, content in file_tree.items():
+        if content:
+            is_valid, errors = parser.validate_syntax(filename, content)
+            if not is_valid:
+                syntax_errors.append({"file": filename, "errors": errors[:3]})
+    
+    if syntax_errors:
+        logger.warning(f"Found {len(syntax_errors)} files with syntax errors")
+        await _push(state, "log", 
+                    message=f"⚠ {len(syntax_errors)} files have syntax errors (will be fixed)")
+   
+    for filename, content in file_tree.items():
+        completed   += 1
+        progress_pct = int((completed / len(file_plan)) * 100)
+
+        await _push(state, "file",
+                    filename=filename,
+                    size=len(content),
+                    completed=completed,
+                    total=len(file_plan),
+                    progress_percent=progress_pct)
+
+        if completed % 5 == 0 or completed == len(file_plan):
+            try:
+                await _call_tool("project_write", {
+                    "project_id": project_id,
+                    "fields": {
+                        "file_tree":           file_tree,
+                        "generation_progress": completed,
+                    },
+                })
+            except Exception as exc:
+                logger.warning("node_generate: incremental save failed",
+                               error=str(exc))
+
+    elapsed = int(time.time() - start_time)
+    success = len(file_tree)
+    failed  = len(file_plan) - success
+
+    state["file_tree"] = file_tree
+    state["status"]    = "generated"
+    state.setdefault("pyright_result", {})
+    state.setdefault("pyright_fixed", False)
+    state.setdefault("pyright_remaining_errors", [])
+
+    logger.info("node_generate: complete",
+                project_id=project_id,
+                success=success, failed=failed, elapsed_s=elapsed)
+
+    await _push(state, "status",
+                status="quality_check",
+                message=f"⚙️ Running quality checks on {success} files…")
+
+    return state
+
+# ═══════════════════════════════════════════════════════════════
+# Node: quality_check
+# ═══════════════════════════════════════════════════════════════
+async def node_quality(state: ProjectState) -> ProjectState:
+    """
+    Quality check + auto-fix node.
+
+    Steps:
+      1. MCP quality_checker tool scan
+      2. Static analysis
+      2b. Direct generation of essential files (README, favicon, .env.example)
+      2c. Auto-fix package.json deps
+      2d. Generate missing planned files via LLM
+      3. Merge issues
+      4. ADK LoopAgent self-heal (concurrent)
+      5. Finalise + persist
+    """
+    
+    project_id   = state.get("project_id", "")
+    user_id      = state.get("user_id",    "")
+    stack        = state.get("stack",      {})
+    spec         = state.get("spec",       {})
+    file_plan    = state.get("file_plan",  [])
+    file_tree    = dict(state.get("file_tree", {}))
+    sd           = _stack_desc(stack)
+    project_name = spec.get("app_name", "")
+    parser       = get_parser()
+
+    # ── Batch fix all Python files with ast-grep ─────────────────────────────
+    try:
+        ast_grep = get_ast_grep()
+        if ast_grep._available:
+            file_tree = ast_grep.batch_fix_files(file_tree)
+            await _push(state, "log",
+                        message="Applied ast-grep fixes to Python files")
+            logger.info("ast-grep batch fix applied",
+                        project_id=project_id,
+                        files=len([f for f in file_tree if f.endswith(".py")]))
+    except Exception as exc:
+        logger.warning(f"ast-grep batch fix failed: {exc}")
+
+    # ── Tracking state (declared before the try so finally can access them) ──
+    fixed_count    = 0
+    heal_results:   list                    = []
+    issues_by_file: dict[str, list[str]]    = {}
+    resolved_files: set[str]                = set()
+    all_issues:     list[dict]              = []
+
+    try:
+        with graph_node_span(
+            "quality", project_id, user_id,
+            stack=sd, project_name=project_name,
+            input_state={"file_count": len(file_tree), "stack": stack},
+        ) as span:
+
+            await _push(state, "status", status="quality_check",
+                        message="🔎 Running quality checks…")
+
+            # ── Step 1 — MCP quality_checker ──────────────────────────────────
+            tool_issues: list[dict] = []
+            try:
+                result = await _call_tool("quality_checker", {
+                    "file_tree": file_tree,
+                    "file_plan": file_plan,
+                })
+                if isinstance(result, dict):
+                    for issue in result.get("issues", []):
+                        if isinstance(issue, str):
+                            tool_issues.append({"file": "", "issue": issue, "fix": issue})
+                        elif isinstance(issue, dict):
+                            tool_issues.append(issue)
+            except Exception as exc:
+                logger.warning("quality_checker tool error", error=str(exc))
+
+            # ── Step 2 — Static analysis ───────────────────────────────────────
+            static_issues = run_static_analysis(file_tree, stack, project_name)
+
+            # ── Step 2b — Auto-generate essential files ────────────────────────
+            auto_generated: set[str] = set()
+
+            # README
+            readme = auto_generate_readme(file_tree, stack, spec, project_name)
+            if readme:
+                file_tree["README.md"] = readme
+                auto_generated.add("README.md")
+                await _push(state, "log", message="✅ Auto-generated README.md")
+                logger.info("node_quality: auto-generated README.md",
+                            project_id=project_id)
+
+            # Wiki documentation
+            if not any(k.startswith("docs/") for k in file_tree):
+                try:
+                    from app.services.wiki_service import generate_wiki_docs
+                    wiki_docs = generate_wiki_docs(file_tree, project_name, stack, spec)
+                    if wiki_docs:
+                        file_tree.update(wiki_docs)
+                        await _push(state, "log",
+                                    message=f"📚 Generated {len(wiki_docs)} documentation pages")
+                        logger.info("node_quality: generated wiki docs",
+                                    project_id=project_id, pages=len(wiki_docs))
+                except Exception as exc:
+                    logger.warning("Wiki doc generation failed (non-fatal)", error=str(exc))
+
+            # Favicons
+            favicons = auto_generate_favicons(file_tree, stack)
+            for fav_path, fav_content in favicons.items():
+                file_tree[fav_path] = fav_content
+                auto_generated.add(fav_path)
+                await _push(state, "log", message=f"✅ Auto-generated {fav_path}")
+                logger.info("node_quality: auto-generated favicon",
+                            path=fav_path, project_id=project_id)
+
+            # AGENT.md — AI agent developer guide
+            if "AGENT.md" not in file_tree and "agent.md" not in file_tree:
+                be = (stack.get("backend",  "") or "").lower()
+                fe = (stack.get("frontend", "") or "").lower()
+
+                if "fastapi" in be or "python" in be:
+                    run_cmd = "pip install -r requirements.txt && uvicorn src.main:app --reload"
+                elif "next" in fe:
+                    run_cmd = "npm install && npm run dev"
+                elif "express" in be or "node" in be:
+                    run_cmd = "npm install && npm start"
+                else:
+                    run_cmd = "See README.md for instructions"
+
+                # Detect env vars from settings
+                env_vars_section = ""
+                settings_path = None
+                for sp in ("config/settings.py", "src/config/settings.py", "src/core/config.py"):
+                    if sp in file_tree:
+                        settings_path = sp
+                        break
+                if settings_path:
+                    env_vars = re.findall(
+                        r'(\w+)\s*:\s*\w+.*?(?:Field\(|$)',
+                        file_tree[settings_path],
+                    )
+                    if env_vars:
+                        env_vars_section = "## Environment Variables\n"
+                        for var in env_vars[:12]:
+                            if not var.startswith("_"):
+                                env_vars_section += f"- `{var}`\n"
+
+                # Detect API routes
+                api_section = ""
+                api_files = [
+                    f for f in file_tree
+                    if f.startswith("src/api/") and f.endswith(".py")
+                    and f != "src/api/__init__.py"
+                ]
+                if api_files:
+                    api_section = "## API Routes\n"
+                    for af in api_files[:8]:
+                        name = af.replace("src/api/", "").replace(".py", "")
+                        api_section += f"- `/{name}`\n"
+
+                file_tree["AGENT.md"] = (
+                    f"# Project: {project_name}\n\n"
+                    f"> Auto-generated developer guide for AI coding agents\n\n"
+                    f"## Stack\n\n"
+                    f"- Frontend: {stack.get('frontend', 'N/A')}\n"
+                    f"- Backend: {stack.get('backend', 'N/A')}\n"
+                    f"- Database: {stack.get('database', 'N/A')}\n\n"
+                    f"## Running Locally\n\n"
+                    f"```bash\n{run_cmd}\n```\n\n"
+                    f"{env_vars_section}\n"
+                    f"{api_section}"
+                    f"## Key Conventions\n\n"
+                    f"- All configuration from `config/settings.py` — never hardcode values\n"
+                    f"- Import paths: `from config.settings import settings`, "
+                    f"`from config.database import get_db`\n"
+                    f"- Pydantic v2: use `model_dump()` not `.dict()`\n"
+                )
+                await _push(state, "log", message="✅ Auto-generated AGENT.md")
+                logger.info("node_quality: auto-generated AGENT.md",
+                            project_id=project_id)
+
+            # ── Step 2c — Auto-fix package.json deps ──────────────────────────
+            file_tree, newly_added = inject_missing_package_deps(file_tree)
+            if newly_added:
+                await _push(state, "log",
+                    message=f"📦 Auto-added {len(newly_added)} missing deps: "
+                            f"{', '.join(newly_added[:6])}"
+                            f"{'…' if len(newly_added) > 6 else ''}")
+                logger.info("node_quality: auto-fixed missing deps",
+                            packages=newly_added, project_id=project_id)
+                resolved = {f"missing dependency: {p}" for p in newly_added}
+                static_issues = [
+                    i for i in static_issues
+                    if not any(r in i.get("issue", "") for r in resolved)
+                ]
+
+            # ── Step 2d — Generate missing planned files ───────────────────────
+            missing_files = find_missing_planned_files(file_tree, file_plan, stack)
+            if missing_files:
+                await _push(state, "log",
+                            message=f"📝 Generating {len(missing_files)} missing file(s)...")
+                for missing_file in missing_files[:5]:
+                    await _push(state, "log",
+                                message=f"  Generating {missing_file}...")
+                    generated = await _generate_missing_file_with_llm(
+                        filepath=missing_file,
+                        spec=spec,
+                        stack=stack,
+                        file_tree=file_tree,
+                        project_name=project_name,
+                        stack_desc=sd,
+                    )
+                    if generated and len(generated.strip()) > 50:
+                        file_tree[missing_file] = generated
+                        auto_generated.add(missing_file)
+                        await _push(state, "log",
+                                    message=f"✅ Generated: {missing_file}")
+                        logger.info("node_quality: generated missing file",
+                                    file=missing_file, project_id=project_id)
+                    else:
+                        await _push(state, "log",
+                                    message=f"⚠ Could not generate {missing_file}")
+
+            # ── PG Durable injection ───────────────────────────────────────────
+            if "pg_durable" in stack.get("extras", []):
+                durable_files = [
+                    "src/services/task_queue.py",
+                    "src/services/outbox.py",
+                    "src/services/healer.py",
+                    "src/workers/__init__.py",
+                    "src/workers/task_processor.py",
+                ]
+                missing_durable = [f for f in durable_files if f not in file_tree]
+                if missing_durable:
+                    logger.warning(f"PG Durable files missing: {missing_durable}")
+                    for f in missing_durable:
+                        file_tree[f] = "" if f.endswith("__init__.py") else (
+                            f"# {f} — PG Durable placeholder\n"
+                        )
+
+            # ── Fix Base class — enforce empty Base ────────────────────────────
+            if "src/models/base.py" in file_tree:
+                content = file_tree["src/models/base.py"]
+                if "Column" in content or "id =" in content or "created_at" in content:
+                    file_tree["src/models/base.py"] = (
+                        "from sqlalchemy.orm import DeclarativeBase\n\n\n"
+                        "class Base(DeclarativeBase):\n"
+                        "    pass\n"
+                    )
+                    logger.info("node_quality: stripped columns from Base class")
+
+            # ── Filter resolved issues ─────────────────────────────────────────
+            static_issues, tool_issues = filter_auto_generated_issues(
+                static_issues, tool_issues, file_tree, auto_generated,
+            )
+
+            # ── Step 3 — Merge issues ──────────────────────────────────────────
+            all_issues      = tool_issues + static_issues
+            state["issues"] = all_issues
+
+            if not all_issues:
+                await _push(state, "log", message="✅ No issues found")
+            else:
+                await _push(state, "issues", issues=all_issues)
+                await _push(state, "log",
+                            message=f"⚠ {len(all_issues)} issue(s) — auto-fixing…")
+
+                # ── Step 4 — Self-heal (concurrent) ───────────────────────────
+                for issue in all_issues:
+                    f   = issue.get("file", "")
+                    fix = issue.get("fix") or issue.get("issue", "")
+                    if f.endswith("__init__.py"):
+                        continue
+                    if f and f in file_tree:
+                        issues_by_file.setdefault(f, []).append(fix)
+
+                # _heal_one reads file_tree for context but never mutates it —
+                # mutations happen below in the results loop under the GIL so
+                # there is no concurrent write hazard here.
+                async def _heal_one(fp: str, fixes: list[str]) -> tuple[str, str | None]:
+                    fixed = await _run_heal_loop_for_file(
+                        filepath=fp,
+                        original_content=file_tree.get(fp, ""),
+                        fix_list=fixes,
+                        stack_desc=sd,
+                        project_id=project_id,
+                        file_tree=file_tree,
+                    )
+                    return fp, fixed
+
+                results = await asyncio.gather(
+                    *[_heal_one(fp, fixes) for fp, fixes in issues_by_file.items()],
+                    return_exceptions=True,
+                )
+
+                for item in results:
+                    if isinstance(item, Exception):
+                        logger.warning("heal gather exception", error=str(item))
+                        continue
+                    fp, fixed_content = item
+                    if fixed_content and len(fixed_content.strip()) > 20:
+                        is_valid, errors = parser.validate_syntax(fp, fixed_content)
+                        if not is_valid:
+                            logger.warning(
+                                f"Heal result for {fp} has syntax errors: {errors[:3]}"
+                            )
+                        file_tree[fp] = fixed_content
+                        fixed_count  += 1
+                        resolved_files.add(fp)
+                        heal_results.append((fp, fixed_content))
+                        await _push(state, "log", message=f"✅ Fixed: {fp}")
+                    else:
+                        await _push(state, "log",
+                                    message=f"⚠ Could not fix {fp} "
+                                            f"(exhausted {MAX_HEAL_ITERATIONS} attempts)")
+
+            # ── Enforce stack rules ────────────────────────────────────────────
+            try:
+                file_tree, stack_fixes = enforce_stack_rules(file_tree, stack)
+                if stack_fixes:
+                    await _push(state, "log",
+                                message=f"🔧 Applied {len(stack_fixes)} stack rule fixes")
+                    for fix in stack_fixes[:5]:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Stack rule fixes applied: {len(stack_fixes)}",
+                                project_id=project_id, fixes=stack_fixes)
+            except Exception as exc:
+                logger.warning(f"Stack rule enforcement failed: {exc}")
+
+            # ── Auth route fixes ───────────────────────────────────────────────
+            try:
+                file_tree, auth_fixes = auto_fix_missing_auth_routes(file_tree)
+                if auth_fixes:
+                    await _push(state, "log",
+                                message=f"🔐 Fixed {len(auth_fixes)} auth route issues")
+                    for fix in auth_fixes:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Auth route fixes applied: {len(auth_fixes)}",
+                                project_id=project_id, fixes=auth_fixes)
+            except Exception as exc:
+                logger.warning(f"Auth route fix failed: {exc}")
+
+            # ── Import fixes ───────────────────────────────────────────────────
+            try:
+                file_tree, import_fixes = auto_fix_missing_imports(file_tree)
+                if import_fixes:
+                    await _push(state, "log",
+                                message=f"🔧 Fixed {len(import_fixes)} import issues")
+                    for fix in import_fixes[:5]:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Import fixes applied: {len(import_fixes)}",
+                                project_id=project_id, fixes=import_fixes)
+            except Exception as exc:
+                logger.warning(f"Import fix failed: {exc}")
+
+            # ── Runtime import fixes ───────────────────────────────────────────
+            try:
+                file_tree, runtime_fixes = auto_fix_runtime_imports(file_tree)
+                if runtime_fixes:
+                    await _push(state, "log",
+                                message=f"🔧 Fixed {len(runtime_fixes)} missing imports")
+                    for fix in runtime_fixes[:5]:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Runtime import fixes applied: {len(runtime_fixes)}",
+                                project_id=project_id, fixes=runtime_fixes)
+            except Exception as exc:
+                logger.warning(f"Runtime import fix failed: {exc}")
+
+            # ── Schema fixes ───────────────────────────────────────────────────
+            try:
+                file_tree, schema_fixes = auto_fix_missing_schema_classes(file_tree)
+                if schema_fixes:
+                    await _push(state, "log",
+                                message=f"📐 Fixed {len(schema_fixes)} schema issues")
+                    for fix in schema_fixes[:5]:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Schema fixes applied: {len(schema_fixes)}",
+                                project_id=project_id, fixes=schema_fixes)
+            except Exception as exc:
+                logger.warning(f"Schema fix failed: {exc}")
+
+            # ── Database function fixes ────────────────────────────────────────
+            try:
+                file_tree, db_fixes = auto_fix_missing_database_functions(file_tree)
+                if db_fixes:
+                    await _push(state, "log",
+                                message=f"🗄️ Fixed {len(db_fixes)} database issues")
+                    for fix in db_fixes[:5]:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Database fixes applied: {len(db_fixes)}",
+                                project_id=project_id, fixes=db_fixes)
+            except Exception as exc:
+                logger.warning(f"Database fix failed: {exc}")
+
+            # ── Template route fixes ───────────────────────────────────────────
+            try:
+                file_tree, route_fixes = validate_template_routes(file_tree)
+                if route_fixes:
+                    await _push(state, "log",
+                                message=f"🌐 Added {len(route_fixes)} missing template routes")
+                    for fix in route_fixes:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Template route fixes applied: {len(route_fixes)}",
+                                project_id=project_id, fixes=route_fixes)
+            except Exception as exc:
+                logger.warning(f"Template route validation failed: {exc}")
+
+            # ── Router prefix fixes ────────────────────────────────────────────
+            try:
+                file_tree, prefix_fixes = fix_router_prefixes(file_tree)
+                if prefix_fixes:
+                    await _push(state, "log",
+                                message=f"🔗 Fixed {len(prefix_fixes)} router prefixes")
+                    for fix in prefix_fixes:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"Router prefix fixes applied: {len(prefix_fixes)}",
+                                project_id=project_id, fixes=prefix_fixes)
+            except Exception as exc:
+                logger.warning(f"Router prefix fix failed: {exc}")
+
+            # ── main.py fixes ──────────────────────────────────────────────────
+            try:
+                file_tree, main_fixes = fix_main_py_issues(file_tree)
+                if main_fixes:
+                    await _push(state, "log",
+                                message=f"🔧 Fixed {len(main_fixes)} main.py issues")
+                    for fix in main_fixes:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"main.py fixes applied: {len(main_fixes)}",
+                                project_id=project_id, fixes=main_fixes)
+            except Exception as exc:
+                logger.warning(f"main.py fix failed: {exc}")
+
+            # In node_quality, before the final persistence:
+            try:
+                from app.agents.quality_checks import simplify_init_files
+                file_tree, init_fixes = simplify_init_files(file_tree)
+                if init_fixes:
+                    await _push(state, "log", 
+                                message=f"📦 Simplified {len(init_fixes)} __init__.py files")
+                    for fix in init_fixes:
+                        await _push(state, "log", message=f"  - {fix}")
+                    logger.info(f"init fixes applied: {len(init_fixes)}", 
+                                project_id=project_id, fixes=init_fixes)
+            except Exception as exc:
+                logger.warning(f"__init__.py fix failed: {exc}")
+        
+            # ── Final Tree-sitter validation pass ─────────────────────────────
+            syntax_errors = []
+            for filepath, content in file_tree.items():
+                if content and not any(x in filepath for x in BINARY_EXT):
+                    is_valid, errors = parser.validate_syntax(filepath, content)
+                    if not is_valid:
+                        syntax_errors.append({"file": filepath, "errors": errors[:3]})
+
+            if syntax_errors:
+                await _push(state, "log",
+                            message=f"⚠ {len(syntax_errors)} files still have syntax errors "
+                                    "(may need manual review)")
+                logger.warning(f"Final syntax errors: {len(syntax_errors)} files",
+                               project_id=project_id)
+            else:
+                await _push(state, "log",
+                            message="✅ All files passed syntax validation")
+
+            # ── Step 5 — Finalise ──────────────────────────────────────────────
+            remaining = len(all_issues) - fixed_count
+            await _push(state, "log",
+                        message=(
+                            f"⚠ {remaining} issue(s) could not be auto-fixed"
+                            if remaining > 0
+                            else "✅ All issues resolved"
+                        ))
+
+            # ── Log SkillOpt trajectories ──────────────────────────────────────
+            await log_skillopt_trajectories(
+                project_id=project_id,
+                state=state,
+                stack=stack,
+                stack_desc=sd,
+                attempt_count=len(issues_by_file),
+                fixed_count=fixed_count,
+                total_issues=len(all_issues),
+                heal_results=heal_results,
+            )
+
+            # ── Push updated issues list (reflects post-heal state in UI) ──────
+            remaining_issues = [
+                issue for issue in all_issues
+                if issue.get("file", "") not in resolved_files
+            ]
+            await _push(state, "issues", issues=remaining_issues)
+
+            # ── Persist ────────────────────────────────────────────────────────
+            state["file_tree"] = file_tree
+            state["status"]    = "complete"
+
+            await _call_tool("project_write", {
+                "project_id": project_id,
+                "fields": {
+                    "status":     "complete",
+                    "file_tree":  file_tree,
+                    "file_count": len(file_tree),
+                },
+            })
+
+            await _push(state, "log",
+                        message=f"💾 Saved {len(file_tree)} files to database")
+
+            if span.is_recording():
+                span.set_attribute(OTEL_ATTRS["issues_found"], len(all_issues))
+                span.set_attribute(OTEL_ATTRS["issues_fixed"], fixed_count)
+                span.set_attribute(
+                    "chiscode.node.output_state",
+                    _json.dumps({
+                        "file_count":   len(file_tree),
+                        "issues_found": len(all_issues),
+                        "issues_fixed": fixed_count,
+                        "status":       "complete",
+                    }),
+                )
+
+    except Exception as exc:
+        state["error"]  = str(exc)
+        state["status"] = "failed"
+        logger.error("node_quality failed", error=str(exc))
+        await _push(state, "error",
+                    message=f"Quality check failed: {str(exc)[:200]}")
+
+    finally:
+        if state.get("status") != "failed":
+            await _push(state, "complete",
+                        file_count=len(state.get("file_tree", {})),
+                        message=f"{len(state.get('file_tree', {}))} files ready "
+                                "— review and push to GitHub")
+
+    return state
+
+# ═══════════════════════════════════════════════════════════════
+# Node: env secrets (env config)
+# ═══════════════════════════════════════════════════════════════
+
+async def analyze_env_secrets(
+    project_id: str,
+    file_tree:  dict[str, str],
+    spec:       dict,
+    stack:      dict,
+) -> list[dict]:
+    """
+    Targeted secrets analysis — reads only config files and .env.example.
+    Merges pydantic BaseSettings fields + .env.example vars.
+    Codestral explains every detected secret.
+    """
+    import re as _re
+    import json as _json
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_mistralai import ChatMistralAI
+
+    parts      = [v for k, v in stack.items()
+                  if k in ("frontend", "backend", "database")
+                  and v and v.lower() != "none"]
+    stack_desc = " + ".join(parts) if parts else "Unknown"
+
+    description = (spec.get("description") or "").lower()
+    features    = [f.lower() for f in spec.get("features", [])]
+    app_name    = (spec.get("app_name")    or "").lower()
+
+    # ── Vars with framework defaults — never ask user ─────────
+    CONFIG_WITH_DEFAULTS = {
+        "ALGORITHM", "ACCESS_TOKEN_EXPIRE_MINUTES", "TOKEN_EXPIRE_HOURS",
+        "LOG_LEVEL", "WORKERS", "RELOAD", "CORS_ORIGINS",
+        "MAX_CONNECTIONS", "POOL_SIZE", "DEBUG", "PORT", "HOST",
+        "ENVIRONMENT", "APP_ENV", "NODE_ENV", "PYTHONPATH",
+        "PATH", "HOME", "USER", "TRUE", "FALSE", "NONE", "NULL",
+        "VITE_APP_TITLE", "VITE_APP_DESCRIPTION",
+        "NEXT_PUBLIC_APP_NAME", "APP_NAME", "APP_TITLE",
+    }
+
+    # ── Deployment infra — not needed for preview ─────────────
+    INFRA_VARS = {
+        "VERCEL_URL", "VERCEL_TOKEN", "RAILWAY_URL", "RAILWAY_TOKEN",
+        "FLY_APP_NAME", "FLY_API_TOKEN", "HEROKU_APP_NAME",
+        "RENDER_EXTERNAL_URL", "CF_PAGES_URL",
+        "NEXT_PUBLIC_VERCEL_URL", "NEXT_PUBLIC_API_URL",
+        "NEXT_PUBLIC_TRPC_URL",
+    }
+
+    SKIP_VARS = CONFIG_WITH_DEFAULTS | INFRA_VARS
+
+    # ── Step 1: Locate config files only ──────────────────────
+    CONFIG_FILE_PRIORITY = [
+        # FastAPI / Python
+        "src/config/settings.py",
+        "src/config.py",
+        "app/config/settings.py",
+        "app/config.py",
+        "config/settings.py",
+        "core/config.py",
+        "src/core/config.py",
+        # Django
+        "settings.py",
+        "config/settings/base.py",
+        "config/settings/local.py",
+        # SvelteKit
+        "src/lib/config.ts",
+        "src/lib/config.js",
+        "src/config.ts",
+        "src/config.js",
+        # React / Next / Vite
+        "config.ts",
+        "config.js",
+        # Node / Express
+        "src/config/index.ts",
+        "src/config/index.js",
+        "config/index.ts",
+        "config/index.js",
+        # Universal
+        ".env.example",
+        ".env.local.example",
+        ".env",
+    ]
+
+    config_sources: dict[str, str] = {}
+    for path in CONFIG_FILE_PRIORITY:
+        if path in file_tree and file_tree[path]:
+            config_sources[path] = file_tree[path]
+
+    if not config_sources:
+        logger.info("No config files found", project_id=project_id)
+        return []
+
+    logger.info("Config files found",
+                project_id=project_id,
+                files=list(config_sources.keys()))
+    # ── NEW: Use Tree-sitter to parse Python config ─────────────
+   
+    # ── Step 2: Parse pydantic BaseSettings fields ────────────
+    pydantic_required: list[str] = []
+    pydantic_optional: list[str] = []
+
+    for path, content in config_sources.items():
+        if not path.endswith(".py"):
+            continue
+        if "BaseSettings" not in content:
+            continue
+
+        # Try Tree-sitter first for Python parsing
+        tree = parser.parse(path, content)
+        if tree:
+            # Extract class definitions and fields using Tree-sitter queries
+            # (This is a simplified version - you'd want to use proper queries)
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Use the existing regex logic as fallback
+                # (Tree-sitter query would be more accurate)       
+
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Required — type annotation, no default
+            m = _re.match(
+                r'^([a-z_][a-z0-9_]*)\s*:\s*\w[\w\[\], |]*\s*$',
+                line, _re.IGNORECASE,
+            )
+            if m:
+                var = m.group(1).upper()
+                if var not in SKIP_VARS:
+                    pydantic_required.append(var)
+                continue
+
+            # Required via Field(...)
+            m2 = _re.match(
+                r'^([a-z_][a-z0-9_]*)\s*:\s*\w[\w\[\], |]*\s*='
+                r'\s*Field\(\.\.\.',
+                line, _re.IGNORECASE,
+            )
+            if m2:
+                var = m2.group(1).upper()
+                if var not in SKIP_VARS:
+                    pydantic_required.append(var)
+                continue
+
+            # Optional — has a default value
+            m3 = _re.match(
+                r'^([a-z_][a-z0-9_]*)\s*:\s*\w[\w\[\], |]*\s*='
+                r'\s*(?!Field\(\.\.\.)',
+                line, _re.IGNORECASE,
+            )
+            if m3:
+                var = m3.group(1).upper()
+                if (var not in SKIP_VARS
+                        and var not in pydantic_required):
+                    pydantic_optional.append(var)
+
+    # ── Step 3: Parse .env.example / .env ─────────────────────
+    env_required: list[str] = []
+    env_optional: list[str] = []
+
+    for path in (".env.example", ".env.local.example", ".env"):
+        content = config_sources.get(path, "")
+        if not content:
+            continue
+
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or (line.startswith("#") and "=" not in line):
+                continue
+
+            # Commented placeholder  →  # VAR=value
+            commented = _re.match(
+                r'^#\s*([A-Z_][A-Z0-9_]+)\s*=\s*(.*)$', line)
+            if commented:
+                var = commented.group(1).strip()
+                val = commented.group(2).strip()
+                if (var not in SKIP_VARS
+                        and var not in pydantic_required
+                        and var not in pydantic_optional):
+                    if not val or "your_" in val.lower() or "TODO" in val:
+                        env_required.append(var)
+                    else:
+                        env_optional.append(var)
+                continue
+
+            # Active var  →  VAR=value
+            active = _re.match(
+                r'^([A-Z_][A-Z0-9_]+)\s*=\s*(.*)$', line)
+            if active:
+                var = active.group(1).strip()
+                val = active.group(2).strip()
+                if (var not in SKIP_VARS
+                        and var not in pydantic_required
+                        and var not in pydantic_optional):
+                    is_placeholder = (
+                        not val
+                        or "your_" in val.lower()
+                        or "example" in val.lower()
+                        or "TODO" in val
+                        or val.startswith("http://localhost")
+                        or val in ("true", "false", "null",
+                                   "none", "''", '""')
+                    )
+                    if is_placeholder:
+                        env_required.append(var)
+                    else:
+                        env_optional.append(var)
+
+    # ── Step 4: Merge ─────────────────────────────────────────
+    all_required = list(dict.fromkeys(pydantic_required + env_required))
+    all_optional = list(dict.fromkeys(pydantic_optional + env_optional))
+    all_optional = [v for v in all_optional if v not in all_required]
+
+    if not all_required and not all_optional:
+        logger.info("No secrets needed — all config has defaults",
+                    project_id=project_id)
+        return []
+
+    logger.info("Secrets detected",
+                project_id=project_id,
+                required=all_required,
+                optional=all_optional)
+
+    # ── Step 5: Codestral explains every detected var ─────────
+    # Build compact config excerpt — max 3 files, 1500 chars each
+    config_excerpt = ""
+    for path, content in list(config_sources.items())[:3]:
+        config_excerpt += f"\n--- {path} ---\n{content[:1500]}\n"
+
+    required_list = "\n".join(f"- {v} [REQUIRED]" for v in all_required)
+    optional_list = "\n".join(f"- {v} [OPTIONAL]" for v in all_optional)
+    var_list      = "\n".join(filter(None, [required_list, optional_list]))
+
+    llm = ChatMistralAI(
+        model=settings.codestral_model,
+        api_key=settings.codestral_api_key,
+        base_url=settings.codestral_base_url,
+        temperature=0.1,
+        max_tokens=4000,
+    )
+
+    resp = await llm.ainvoke([
+        SystemMessage(content=(
+            f"You are analyzing a {stack_desc} project config file "
+            "to explain required environment secrets to a developer.\n\n"
+            "For each variable return a JSON array of objects:\n"
+            "[\n"
+            "  {\n"
+            '    "name": "VAR_NAME",\n'
+            '    "description": "One sentence — what this is and why the app needs it",\n'
+            '    "how_to_get": "Clear numbered steps to obtain this exact value",\n'
+            '    "required": true or false,\n'
+            '    "example": "realistic example (never a real secret)",\n'
+            '    "default": "sensible local dev default or null",\n'
+            '    "category": "database|auth|api|storage|email|other",\n'
+            '    "docs_url": "official docs URL or null"\n'
+            "  }\n"
+            "]\n\n"
+            "STRICT RULES:\n"
+            "- Include EVERY variable from the list — do not drop any\n"
+            "- Mark [REQUIRED] vars as required: true\n"
+            "- Mark [OPTIONAL] vars as required: false\n"
+            "- Skip nothing — even if you think it has a default\n"
+            "- DATABASE_URL: required if postgres/mysql, optional if sqlite\n"
+            "- SECRET_KEY / JWT_SECRET: always required, "
+            "  how_to_get = 'Run: openssl rand -hex 32'\n"
+            "- API keys: give the exact dashboard URL to find the key\n"
+            "- Return ONLY the JSON array — no markdown, no explanation"
+        )),
+        HumanMessage(content=(
+            f"Project: {spec.get('app_name', 'App')}\n"
+            f"Description: {spec.get('description', '')}\n"
+            f"Features: {', '.join(spec.get('features', []))}\n"
+            f"Stack: {stack_desc}\n\n"
+            f"Config file contents:\n{config_excerpt}\n\n"
+            f"Variables to analyze:\n{var_list}"
+        )),
+    ])
+
+    # ── Step 6: Parse and return ──────────────────────────────
+    try:
+        raw = resp.content.strip()
+        raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = _re.sub(r"\s*```$",          "", raw)
+        analysis: list[dict] = _json.loads(raw)
+
+        # Post-filter — remove anything Codestral added
+        # that belongs in CONFIG_WITH_DEFAULTS or INFRA_VARS
+        analysis = [
+            s for s in analysis
+            if s.get("name", "") not in SKIP_VARS
+        ]
+
+        # Ensure required flag matches our parser result
+        for s in analysis:
+            if s.get("name") in all_required:
+                s["required"] = True
+            elif s.get("name") in all_optional:
+                s["required"] = False
+            s.setdefault("files", [])
+
+        # Sort — required before optional
+        analysis.sort(key=lambda s: (0 if s.get("required") else 1))
+
+    except Exception as exc:
+        logger.warning("Codestral parse failed — fallback",
+                       error=str(exc))
+        analysis = [
+            {
+                "name":        var,
+                "description": f"Required by {list(config_sources.keys())[0]}",
+                "how_to_get":  "Check your service provider dashboard.",
+                "required":    var in all_required,
+                "example":     f"your_{var.lower()}_value",
+                "default":     None,
+                "category":    "other",
+                "docs_url":    None,
+                "files":       [],
+            }
+            for var in all_required + all_optional
+        ]
+
+    logger.info("Secrets analysis complete",
+                project_id=project_id,
+                total=len(analysis),
+                required=sum(1 for s in analysis if s.get("required")),
+                optional=sum(1 for s in analysis if not s.get("required")),
+                sources=list(config_sources.keys()))
+
+    return analysis
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Workflow 4 — GitHub push
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def node_github_push(state: ProjectState) -> ProjectState:
+    await _push(state, "status", status="committing",
+                message="📡 Pushing to GitHub...")
+    try:
+        project_name = state.get("project_name", "chiscode-project")
+        repo_name    = _re.sub(r"[^a-zA-Z0-9_.-]", "-", project_name.lower())
+        repo_name    = _re.sub(r"-+", "-", repo_name).strip("-")[:100]
+        spec         = state.get("spec", {})
+
+        await _push(state, "log",
+                    message=f"📦 Creating repository: {repo_name}...")
+
+        result = await _call_tool("github_push", {
+            "github_token":   state["github_token"],
+            "repo_name":      repo_name,
+            "description":    spec.get("description", "")[:255],
+            "file_tree":      state.get("file_tree", {}),
+            "commit_message": state.get("commit_message",
+                                        "Initial commit — generated by ChisCode"),
+            "private":        False,
+        })
+
+        state["repo_url"]   = result["repo_url"]
+        state["commit_sha"] = result["commit_sha"]
+        state["status"]     = "complete"
+
+        await _call_tool("project_write", {
+            "project_id": state["project_id"],
+            "fields": {
+                "status":           "complete",
+                "github_repo_url":  result["repo_url"],
+                "github_repo_name": repo_name,
+                "github_owner":     result["owner"],
+                "current_version":  1,
+            },
+        })
+
+        await _push(state, "log",
+                    message=f"✅ Repository: {result['repo_url']}")
+        await _push(state, "github_done",
+                    repo_url=result["repo_url"],
+                    commit_sha=result["commit_sha"],
+                    message="Code pushed to GitHub successfully!")
+
+    except Exception as exc:
+        state["error"]  = str(exc)
+        state["status"] = "failed"
+        await _push(state, "error", message=f"GitHub push failed: {exc}")
+        await _call_tool("project_write", {
+            "project_id": state["project_id"],
+            "fields": {"status": "failed", "error_message": str(exc)},
+        })
+
+    return state
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Workflow 5 — Iterate  (ADK Phase 2b)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def node_iterate(state: ProjectState) -> ProjectState:
+    """
+    Plan + patch changed files, commit directly to main.
+    Phase 2b: IteratePatcher + ParallelAgent replaces the manual
+    asyncio.Queue + _patch_one drain loop.
+    """
+    iterate_prompt = state.get("iterate_prompt", "")
+    version        = state.get("version", 2)
+    file_tree      = state.get("file_tree", {})
+    stack          = state.get("stack", {})
+    sd             = _stack_desc(stack)
+
+    await _push(state, "status", status="generating",
+                message="🔄 Planning changes...")
+
+    # ── NEW: Use Instructor for structured planning ──────────────
+    from app.llm.structured import generate_structured
+    
+    try:
+        # Try to get structured plan first
+        class IterationPlan(BaseModel):
+            files_to_change: list[str]
+            reasoning: str
+            
+        plan: IterationPlan = await generate_structured(
+            prompt=(
+                f"Project files:\n"
+                + "\n".join(f"  - {f}" for f in file_tree.keys())
+                + f"\n\nChange request: {iterate_prompt}\n\n"
+                "List every file that needs to be modified or created."
+            ),
+            response_model=IterationPlan,
+            system_prompt="You are planning code changes. Be precise.",
+        )
+        files_to_change = plan.files_to_change[:20]
+        await _push(state, "log",
+                    message=f"📋 Planned: {', '.join(files_to_change)}")
+    except Exception as exc:
+        logger.warning("Iteration plan with Instructor failed, falling back", error=str(exc))
+
+        # ── Load project from DB ──────────────────────────────────────────────────
+        try:
+            project = await _call_tool("project_read", {
+                "project_id": state["project_id"]})
+            for key, db_key in [
+                ("github_owner",     "github_owner"),
+                ("github_repo_name", "github_repo_name"),
+                ("file_tree",        "file_tree"),
+                ("spec",             "spec"),
+                ("stack",            "stack"),
+            ]:
+                if not state.get(key):
+                    state[key] = project.get(db_key, {} if key in
+                                             ("file_tree", "spec", "stack") else "")
+        except Exception as exc:
+            await _push(state, "error", message=f"Failed to load project: {exc}")
+            state["error"]  = str(exc)
+            state["status"] = "failed"
+            return state
+
+    if not state.get("github_token"):
+        await _push(state, "error",
+                    message="GitHub token not found — connect GitHub first")
+        state["error"]  = "github_token missing"
+        state["status"] = "failed"
+        return state
+
+    if not state.get("github_owner") or not state.get("github_repo_name"):
+        await _push(state, "error",
+                    message="No GitHub repo linked — push to GitHub first")
+        state["error"]  = "no github repo"
+        state["status"] = "failed"
+        return state
+
+    file_tree = state.get("file_tree", {})
+    stack     = state.get("stack", {})
+    sd        = _stack_desc(stack)
+
+    # ── Plan which files to change ────────────────────────────────────────────
+    try:
+        plan_result = await _call_tool("code_generator", {
+            "filename":      "_plan.json",
+            "system_prompt": (
+                "You are a senior software engineer planning a code change.\n"
+                "Return ONLY valid JSON: {\"files\": [\"path1\", \"path2\"]}"
+            ),
+            "user_prompt": (
+                f"Current project files:\n"
+                + "\n".join(f"  - {f}" for f in file_tree.keys())
+                + f"\n\nChange request: {iterate_prompt}\n\n"
+                "List every file that needs to be modified or created."
+            ),
+        })
+        raw             = _strip_fences(plan_result.get("content", ""))
+        files_to_change = json.loads(raw).get("files",
+                                              list(file_tree.keys())[:3])
+    except Exception as exc:
+        logger.warning("iterate plan parse failed", error=str(exc))
+        files_to_change = list(file_tree.keys())[:3]
+
+    await _push(state, "log",
+                message=f"📋 Files to update: {', '.join(files_to_change)}")
+
+    # ── Phase 2b — parallel patch via ADK ────────────────────────────────────
+    try:
+        changed_files = await _run_parallel_patch(
+            files_to_change=files_to_change,
+            file_tree=file_tree,
+            iterate_prompt=iterate_prompt,
+            stack_desc=sd,
+            project_id=state.get("project_id", ""),
+        )
+    except Exception as exc:
+        state["error"]  = str(exc)
+        state["status"] = "failed"
+        await _push(state, "error", message=f"Patch failed: {exc}")
+        return state
+
+    if not changed_files:
+        state["error"]  = "No files were updated"
+        state["status"] = "failed"
+        await _push(state, "error", message="No files were updated")
+        return state
+
+    # ── NEW: Validate patched files with Tree-sitter ─────────────
+    parser = get_parser()
+    patched_errors = []
+    for filename, content in changed_files.items():
+        if content:
+            is_valid, errors = parser.validate_syntax(filename, content)
+            if not is_valid:
+                patched_errors.append({"file": filename, "errors": errors[:3]})
+    
+    if patched_errors:
+        await _push(state, "log",
+                    message=f"⚠ {len(patched_errors)} patched files have syntax errors")
+    # SSE progress events
+    for filename, content in changed_files.items():
+        file_tree[filename] = content
+        await _push(state, "file", filename=filename, size=len(content))
+
+    # ── Quality check on changed files ────────────────────────────────────────
+    try:
+        qc = await _call_tool("quality_checker", {
+            "file_tree": changed_files,
+            "file_plan": list(changed_files.keys()),
+        })
+        if qc.get("issues"):
+            await _push(state, "issues", issues=qc["issues"])
+    except Exception as exc:
+        logger.warning("iterate quality_checker error", error=str(exc))
+
+    # ── Commit to main ────────────────────────────────────────────────────────
+    await _push(state, "status", status="committing",
+                message="⬆ Committing changes to main...")
+    try:
+        from app.services.github_service import GitHubService
+        gh = GitHubService(state["github_token"])
+        await gh.push_files(
+            owner=state["github_owner"],
+            repo=state["github_repo_name"],
+            file_tree=file_tree,
+            commit_message=f"feat: {iterate_prompt[:72]}",
+            branch="main",
+        )
+
+        state["file_tree"] = file_tree
+        state["status"]    = "complete"
+
+        await _call_tool("project_write", {
+            "project_id": state["project_id"],
+            "fields": {
+                "status":          "complete",
+                "file_tree":       file_tree,
+                "current_version": version,
+            },
+        })
+
+        repo_url = (f"https://github.com/{state['github_owner']}"
+                    f"/{state['github_repo_name']}")
+        await _push(state, "github_done",
+                    commit_sha="",
+                    repo_url=repo_url,
+                    message=f"✅ {len(file_tree)} files committed to main "
+                            f"({len(changed_files)} updated)")
+
+    except Exception as exc:
+        state["error"] = str(exc)
+        await _push(state, "error", message=f"Commit failed: {exc}")
+
+    return state
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _build_file_hint  (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_file_hint(filename: str, stack: dict) -> str:
+    """Return a file-specific generation hint string."""
+    from app.agents.prompts.generation_context import get_generation_context
+    return get_generation_context(filename, stack)
+# ═══════════════════════════════════════════════════════════════
+# Graph builders
+# ═══════════════════════════════════════════════════════════════
+
+def _route_after_analyze(state: ProjectState) -> Literal["end"]:
+    """Always pause after analyze for HITL stack selection."""
+    if not isinstance(state, dict):
+        logger.error(f"_route_after_analyze received non-dict: {type(state)}")
+        return "end"
+    return "end"
+
+def _route_after_generate(state: ProjectState) -> Literal["quality", "end"]:
+    """Route to quality check or end based on error status."""
+    if not isinstance(state, dict):
+        logger.error(f"_route_after_generate received non-dict state: {type(state)}")
+        return "end"
+    return "end" if state.get("error") else "quality"
+    
+def build_analyze_graph() -> StateGraph:
+    """Graph 1 — called by /generate. Terminates after stack_suggestion SSE."""
+    g = StateGraph(ProjectState)
+    g.add_node("analyze", node_analyze)
+    g.set_entry_point("analyze")
+    g.add_edge("analyze", END)
+    return g.compile()
+
+
+def build_generate_graph() -> StateGraph:
+    """
+    Graph 3 — called by /generate/run.
+    ADK Phase 3 — scaffold → generate → quality as a deterministic
+    sequential pipeline (SequentialAgent semantics at the node level).
+
+      node_scaffold:  MCP file_scaffold call → file_plan in state
+      node_generate:  ADK PlannerAndRunner + ParallelAgent  (Phase 2)
+      node_quality:   ADK LoopAgent per-file self-heal        (Phase 1)
+    """
+    g = StateGraph(ProjectState)
+    g.add_node("scaffold", node_scaffold)
+    g.add_node("generate", node_generate)
+    g.add_node("quality",  node_quality)
+    g.set_entry_point("scaffold")
+    g.add_edge("scaffold", "generate")
+    g.add_edge("generate", "quality")
+    g.add_edge("quality",  END)
+    return g.compile()
+
+def build_full_generate_graph() -> StateGraph:
+    """
+    Full pipeline: analyze → auto-select stack → scaffold → generate → pyright → quality.
+    No HITL — the best stack is auto-selected from analysis.
+    
+    Pyright runs AFTER generation, BEFORE quality check.
+    If Pyright is clean, quality check is skipped entirely (saves Codestral calls).
+    """
+    g = StateGraph(ProjectState)
+    g.add_node("analyze", node_analyze)
+    g.add_node("auto_select_stack", node_auto_select_stack)
+    g.add_node("scaffold", node_scaffold)
+    g.add_node("generate", node_generate)
+    g.add_node("quality",  node_quality)
+
+    g.set_entry_point("analyze")
+    g.add_edge("analyze", "auto_select_stack")
+    g.add_edge("auto_select_stack", "scaffold")
+    g.add_edge("scaffold", "generate")
+    g.add_edge("generate", "quality")  
+    g.add_edge("quality", END)
+    return g.compile()
+
+
+def build_github_graph() -> StateGraph:
+    """Graph 4 — push files to GitHub."""
+    g = StateGraph(ProjectState)
+    g.add_node("github_push", node_github_push)
+    g.add_edge(START,         "github_push")
+    g.add_edge("github_push", END)
+    return g.compile()
+
+
+def build_iterate_graph() -> StateGraph:
+    """Graph 5 — plan → patch (ADK Phase 2b) → commit to main."""
+    g = StateGraph(ProjectState)
+    g.add_node("iterate", node_iterate)
+    g.add_edge(START,     "iterate")
+    g.add_edge("iterate", END)
+    return g.compile()
+
+# ═══════════════════════════════════════════════════════════════
+# Public SSE runner
+# ═══════════════════════════════════════════════════════════════
+
+async def run_workflow(
+    graph:         StateGraph,
+    initial_state: ProjectState,
+) -> AsyncGenerator[str, None]:
+    """
+    Run a LangGraph workflow, yielding SSE strings as events arrive.
+    Injects a queue into state so nodes can push events mid-execution.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    initial_state["_sse_queue"] = queue
+
+    async def _run():
+        try:
+            await graph.ainvoke(initial_state)
+        except Exception as exc:
+            await queue.put(_sse("error", message=f"Workflow error: {exc}"))
+        finally:
+            await queue.put(None)  # sentinel
+
+    task = asyncio.create_task(_run())
+
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        yield item
+
+    await task
+
